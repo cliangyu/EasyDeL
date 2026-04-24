@@ -30,7 +30,8 @@ Classes land in the order specified by the port plan (lowest risk first):
    position embedding (pure math, no learnable parameters). **Landed.**
 2. :class:`Gemma4AudioClippableLinear` — linear with optional per-layer
    input/output clamp buffers. **Landed.**
-3. ``Gemma4AudioFeedForward`` — TBD
+3. :class:`Gemma4AudioFeedForward` — Macaron FFN with pre+post RMSNorm and
+   residual half-step (``residual_weight=0.5``). **Landed.**
 4. ``Gemma4AudioLightConv1d`` — TBD
 5. ``Gemma4AudioSubSampleConvProjection`` — TBD
 6. ``Gemma4AudioAttention`` — TBD
@@ -48,9 +49,11 @@ from eformer.common_types import Replicated
 from flax import nnx as nn
 from jaxtyping import Array, Float
 
+from easydel.infra.utils import ACT2FN
 from easydel.layers import ColumnParallelLinear
 
 from .gemma4_configuration import Gemma4AudioConfig
+from .modeling_gemma4 import Gemma4RMSNorm
 
 
 class Gemma4AudioRelPositionalEncoding(nn.Module):
@@ -210,4 +213,106 @@ class Gemma4AudioClippableLinear(nn.Module):
         hidden_states = self.linear(hidden_states)
         if self.use_clipped_linears:
             hidden_states = jnp.clip(hidden_states, self.output_min.value, self.output_max.value)
+        return hidden_states
+
+
+class Gemma4AudioFeedForward(nn.Module):
+    """Macaron-style feed-forward block for the audio conformer.
+
+    Direct port of HF's ``Gemma4AudioFeedForward``. The structure matches the
+    Macaron FFN from the Conformer paper (Gulati et al., 2020): the block
+    contributes a *half-step* residual (``post_layer_scale = residual_weight
+    = 0.5``) rather than a full residual, because each conformer layer sandwiches
+    a Macaron FFN on *either side* of the attention block — two halves
+    summing to one full residual pass.
+
+    .. code-block:: text
+
+        residual = x
+        x = clamp(x, -G, +G)           # pre-FFN gradient clip
+        x = pre_layer_norm(x)
+        x = ffw_layer_1(x)             # ClippableLinear, hidden -> 4*hidden
+        x = act_fn(x)                  # silu
+        x = ffw_layer_2(x)             # ClippableLinear, 4*hidden -> hidden
+        x = clamp(x, -G, +G)           # post-FFN gradient clip
+        x = post_layer_norm(x)
+        x = x * post_layer_scale       # 0.5 (Macaron half-step)
+        x = x + residual
+
+    Subtleties that must match HF for parity:
+
+    * **Gradient-clip magnitude** (``G``) is ``min(config.gradient_clipping,
+      finfo(kernel_dtype).max)``. The config default is ``1e10`` — well below
+      bf16's max (~3.39e38), so bf16 weights leave it untouched. fp16 weights
+      would clamp it down to 65504. HF computes this at every forward pass
+      from the live kernel dtype; we compute once at init time because
+      ``param_dtype`` doesn't change.
+    * **Clamps are on the input activations, not the weights.** The name
+      ``gradient_clipping`` is a historical artefact from USM training;
+      at inference it acts as an activation range guard.
+    * **Post-layer-norm is applied to the already-scaled output**, i.e. the
+      RMSNorm happens *before* the residual add but *after* the output
+      clamp. Getting the order wrong changes the activation distribution.
+    * **Scale-by-0.5 is in-place in HF** (``hidden_states *= ...``); we use an
+      explicit multiply for JAX functional purity.
+    * **Biases always off** (inherited from ``Gemma4AudioClippableLinear``).
+    """
+
+    def __init__(
+        self,
+        config: Gemma4AudioConfig,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: nn.Rngs,
+    ):
+        self.config = config
+
+        self.ffw_layer_1 = Gemma4AudioClippableLinear(
+            config,
+            config.hidden_size,
+            config.hidden_size * 4,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.ffw_layer_2 = Gemma4AudioClippableLinear(
+            config,
+            config.hidden_size * 4,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        # HF passes a positional hidden_size but our Gemma4RMSNorm reads it
+        # from the config. Pass the audio config through — it exposes both
+        # ``hidden_size`` and ``rms_norm_eps`` like the text/vision configs.
+        self.pre_layer_norm = Gemma4RMSNorm(config, param_dtype=param_dtype)
+        self.post_layer_norm = Gemma4RMSNorm(config, param_dtype=param_dtype)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+        # Match HF: min(config.gradient_clipping, finfo(kernel_dtype).max).
+        # Precompute — param_dtype is fixed after __init__.
+        self.gradient_clipping = float(min(config.gradient_clipping, float(jnp.finfo(param_dtype).max)))
+        self.post_layer_scale = config.residual_weight
+
+    def __call__(self, hidden_states: Float[Array, "batch seq hidden"]) -> Float[Array, "batch seq hidden"]:
+        residual = hidden_states
+
+        hidden_states = jnp.clip(hidden_states, -self.gradient_clipping, self.gradient_clipping)
+        hidden_states = self.pre_layer_norm(hidden_states)
+
+        hidden_states = self.ffw_layer_1(hidden_states)
+        hidden_states = self.act_fn(hidden_states)
+        hidden_states = self.ffw_layer_2(hidden_states)
+
+        hidden_states = jnp.clip(hidden_states, -self.gradient_clipping, self.gradient_clipping)
+        hidden_states = self.post_layer_norm(hidden_states)
+        hidden_states = hidden_states * self.post_layer_scale
+        hidden_states = hidden_states + residual
+
         return hidden_states
