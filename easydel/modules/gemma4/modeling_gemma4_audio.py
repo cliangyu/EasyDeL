@@ -40,7 +40,9 @@ Classes land in the order specified by the port plan (lowest risk first):
    :class:`Gemma4AudioSubSampleConvProjection` — feature-extractor stem
    that downsamples mel features 4x and projects to ``hidden_size``.
    **Landed.**
-7. ``Gemma4AudioAttention`` — TBD
+7. :class:`Gemma4AudioAttention` — chunked local attention with Shaw-style
+   relative position bias, fp32 islands, softplus per-head scale, softcap
+   before mask. **Landed.**
 8. ``Gemma4AudioLayer`` — TBD
 9. ``Gemma4AudioModel`` — TBD
 """
@@ -55,7 +57,7 @@ from eformer.common_types import Replicated
 from flax import nnx as nn
 from jaxtyping import Array, Float
 
-from easydel.infra.utils import ACT2FN
+from easydel.infra.utils import ACT2FN, ArrayParam
 from easydel.layers import ColumnParallelLinear
 from easydel.layers.norms import LayerNorm
 
@@ -693,3 +695,321 @@ class Gemma4AudioSubSampleConvProjection(nn.Module):
         # Flatten (F/4, C) -> (F/4 * C); already channels-last so no permute.
         hidden_states = hidden_states.reshape(batch_size, t4, f4 * c4)
         return self.input_proj_linear(hidden_states), mask
+
+
+class Gemma4AudioAttention(nn.Module):
+    """Chunked local attention with Shaw-style relative position bias.
+
+    Direct port of HF's ``Gemma4AudioAttention``. This is the most
+    arithmetic-sensitive class in the audio tower; bit-level parity with
+    HF requires getting all of the following right simultaneously:
+
+    Per-block / chunked structure
+    -----------------------------
+    Each token attends to a *local context window* of length
+    ``chunk_size + max_past_horizon + max_future_horizon`` rather than
+    the full sequence. Tokens are grouped into non-overlapping
+    ``chunk_size``-length blocks (queries) but each block looks at an
+    *overlapping* context window of ``context_size`` keys/values
+    (with stride ``chunk_size``). This is implemented via:
+
+    * :meth:`_convert_to_block` — pads sequence to next multiple of
+      chunk and reshapes ``(B, T, H, D)`` → ``(B, NB, chunk, H, D)``.
+    * :meth:`_extract_block_context` — pads with ``max_past_horizon`` on
+      the left and ``max_future_horizon + chunk - 1`` on the right, then
+      gathers overlapping windows ``(B, NB, context, H, D)``.
+
+    For audio config defaults: chunk=12, past=12, future=0,
+    so context = 12 + 12 + 0 = 24.
+
+    Scaling subtleties (must match HF byte-for-byte)
+    ------------------------------------------------
+    * ``q_scale = (head_dim**-0.5) / log(2)`` — natural log, *not*
+      log2; this is paired with ``F.softplus(per_dim_scale)`` which
+      equals ``log(2)`` at init, so the effective initial scale is
+      ``head_dim**-0.5``.
+    * ``k_scale = log(1 + e) / log(2) ≈ 1.895`` — a constant scalar
+      key boost; combined with q_scale at init the effective
+      ``q·k`` factor is ``log(1+e) / (sqrt(d) * log(2))``, ~1.895x
+      the standard ``1/sqrt(d)``. Don't normalise this away.
+    * ``per_dim_scale`` is a learnable head-dim vector initialised to
+      zeros (so ``softplus(0) = log(2)`` at start). Trained
+      checkpoints will populate it.
+
+    fp32 islands
+    ------------
+    HF casts q/k/v to ``float32`` immediately after projection and runs
+    the full attention computation in fp32. The softmax explicitly uses
+    ``dtype=torch.float32`` and the result is cast to ``value_states.dtype``
+    (which is fp32 — so the final cast is a no-op). Only the input to
+    ``self.post`` is cast back to the kernel's ``param_dtype``. We mirror
+    this exactly because softmax in bf16 over wide context windows can
+    underflow.
+
+    Softcap-then-mask ordering
+    --------------------------
+    HF applies the softcap (``softcap * tanh(logits / softcap)``) *before*
+    the mask, then masks invalid positions to ``-1e9``. Reversing the
+    order would clip ``-1e9`` to ``-50`` and destroy the mask. We pin
+    this ordering exactly.
+
+    Mask polarity
+    -------------
+    HF: ``masked_fill(attention_mask.logical_not(), -1e9)`` — i.e.
+    ``mask=True`` means *valid*, the negation flips to invalid which
+    gets the sentinel. Our port mirrors this: pass a boolean mask
+    where ``True`` = attend, ``False`` = sentinel.
+
+    Relative position bias and ``_rel_shift``
+    -----------------------------------------
+    The position embeddings (shape ``(1, 13, hidden)`` from
+    :class:`Gemma4AudioRelPositionalEncoding`) are projected via
+    ``relative_k_proj`` (a *plain* linear, no clamp) and combined with
+    queries to produce ``matrix_bd`` of shape ``(B, H, NB, chunk, 13)``.
+    :meth:`_rel_shift` then transforms this to ``(B, H, NB, chunk,
+    context)`` via the Shaw/Transformer-XL right-pad-then-slice trick
+    (Appendix B of arxiv 1901.02860). Implementation must match HF
+    *exactly*; we copy the pad/reshape/slice pattern verbatim.
+
+    Layer-name convention
+    ---------------------
+    * ``q_proj``, ``k_proj``, ``v_proj``, ``post``: clippable linears
+      (``self.q_proj.linear.kernel`` ↔ HF's ``q_proj.linear.weight``).
+    * ``relative_k_proj``: plain ColumnParallelLinear (HF: plain Linear).
+    * ``per_dim_scale``: learnable parameter, scalar buffer-style.
+    * ``softcap``: stored as a Python float (HF: non-persistent buffer);
+      we don't need it in NNX state.
+    """
+
+    def __init__(
+        self,
+        config: Gemma4AudioConfig,
+        layer_idx: int,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: nn.Rngs,
+    ):
+        self.config = config
+        self.layer_idx = layer_idx
+        self.attention_logits_soft_cap = config.attention_logit_cap
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_heads = config.num_attention_heads
+        self.param_dtype = param_dtype
+
+        # Match HF *exactly* — note natural-log denominators.
+        self.q_scale = (self.head_dim**-0.5) / math.log(2)
+        self.k_scale = math.log(1 + math.e) / math.log(2)
+
+        self.chunk_size = config.attention_chunk_size
+        self.max_past_horizon = config.attention_context_left - 1
+        self.max_future_horizon = config.attention_context_right
+        self.context_size = self.chunk_size + self.max_past_horizon + self.max_future_horizon
+
+        kernel_init = jax.nn.initializers.normal(config.initializer_range)
+
+        self.q_proj = Gemma4AudioClippableLinear(
+            config,
+            config.hidden_size,
+            self.num_heads * self.head_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.k_proj = Gemma4AudioClippableLinear(
+            config,
+            config.hidden_size,
+            self.num_heads * self.head_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.v_proj = Gemma4AudioClippableLinear(
+            config,
+            config.hidden_size,
+            self.num_heads * self.head_dim,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.post = Gemma4AudioClippableLinear(
+            config,
+            config.hidden_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        # HF: nn.Linear(..., bias=False). NOT a clippable linear.
+        self.relative_k_proj = ColumnParallelLinear(
+            config.hidden_size,
+            self.num_heads * self.head_dim,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            rngs=rngs,
+        )
+
+        # HF: nn.Parameter(torch.zeros(head_dim)). Learned per-dim scale.
+        self.per_dim_scale = ArrayParam.bound(
+            shape=(self.head_dim,),
+            dtype=param_dtype,
+            init_method="zeros",
+            key=None,
+        )
+
+        # HF stores softcap as a non-persistent buffer; we just keep the
+        # Python float — no learnable, no checkpoint slot, no NNX state.
+        self.softcap = float(self.attention_logits_soft_cap)
+
+    # -- chunking helpers ----------------------------------------------------
+
+    def _convert_to_block(self, hidden_states: Array) -> Array:
+        """Reshape (B, T, H, D) -> (B, NB, chunk, H, D), zero-padding to a
+        multiple of chunk_size on the time axis.
+
+        Matches HF's ``F.pad(x, (0, 0, 0, 0, 0, pad))``: pad only the time
+        axis with ``pad`` zeros on the right.
+        """
+        batch_size, seq_len, num_heads, head_dim = hidden_states.shape
+        num_blocks = (seq_len + self.chunk_size - 1) // self.chunk_size
+        pad = num_blocks * self.chunk_size - seq_len
+        # Pad spec: ((B), (T_left=0, T_right=pad), (H), (D)).
+        hidden_states = jnp.pad(hidden_states, ((0, 0), (0, pad), (0, 0), (0, 0)))
+        return hidden_states.reshape(batch_size, num_blocks, self.chunk_size, num_heads, head_dim)
+
+    def _extract_block_context(self, hidden_states: Array) -> Array:
+        """Build overlapping ``context_size`` windows for each block.
+
+        HF uses ``F.pad`` followed by ``tensor.unfold(1, context, chunk)``;
+        we replicate that with explicit gather indices. Pad amounts:
+        ``max_past_horizon`` on the left, ``max_future_horizon + chunk - 1``
+        on the right of the time axis.
+
+        Output shape: ``(B, NB, context_size, H, D)``.
+        """
+        seq_len = hidden_states.shape[1]
+        # HF pad spec (last-to-first): (D=0,0), (H=0,0), (T=past, future + chunk - 1).
+        left = self.max_past_horizon
+        right = self.max_future_horizon + self.chunk_size - 1
+        hidden_states = jnp.pad(hidden_states, ((0, 0), (left, right), (0, 0), (0, 0)))
+        # Number of stride-chunk windows of length context_size that fit.
+        num_blocks = (seq_len + self.chunk_size - 1) // self.chunk_size
+        # Gather indices: window b spans [b*chunk, b*chunk + context).
+        block_starts = jnp.arange(num_blocks) * self.chunk_size  # (NB,)
+        offsets = jnp.arange(self.context_size)  # (context,)
+        idx = block_starts[:, None] + offsets[None, :]  # (NB, context)
+        # Fancy index over the time axis.
+        return hidden_states[:, idx, :, :]  # (B, NB, context, H, D)
+
+    def _rel_shift(self, x: Array) -> Array:
+        """Shaw / Transformer-XL relative-position shift for blocked attention.
+
+        Reshapes ``(B, H, NB, chunk, position_length)`` to
+        ``(B, H, NB, chunk, context_size)`` via right-pad + reshape +
+        slice + reshape. See Appendix B of
+        https://huggingface.co/papers/1901.02860. Bit-for-bit copy of HF's
+        five-line implementation.
+        """
+        batch_size, num_heads, num_blocks, block_size, position_length = x.shape
+        context_size = self.context_size
+        # Pad last axis with zeros: (context+1 - position_length) zeros on the right.
+        x = jnp.pad(x, ((0, 0), (0, 0), (0, 0), (0, 0), (0, context_size + 1 - position_length)))
+        x = x.reshape(batch_size, num_heads, num_blocks, block_size * (context_size + 1))
+        x = x[..., : block_size * context_size]
+        return x.reshape(batch_size, num_heads, num_blocks, block_size, context_size)
+
+    # -- forward -------------------------------------------------------------
+
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq hidden"],
+        position_embeddings: Float[Array, "1 13 hidden"],
+        attention_mask: Array | None = None,
+    ) -> tuple[Float[Array, "batch seq hidden"], Array]:
+        batch_size, seq_length, _ = hidden_states.shape
+
+        # Project Q/K/V then immediately upcast to fp32 (HF parity).
+        query_states = self.q_proj(hidden_states).astype(jnp.float32)
+        key_states = self.k_proj(hidden_states).astype(jnp.float32)
+        value_states = self.v_proj(hidden_states).astype(jnp.float32)
+
+        # Reshape to (B, T, H, D).
+        hidden_shape = (batch_size, seq_length, self.num_heads, self.head_dim)
+        query_states = query_states.reshape(hidden_shape)
+        key_states = key_states.reshape(hidden_shape)
+        value_states = value_states.reshape(hidden_shape)
+
+        # Per-dim softplus-scaled query, scalar-scaled key. Cast scale to fp32.
+        per_dim = jax.nn.softplus(self.per_dim_scale.value.astype(jnp.float32))
+        query_states = query_states * jnp.float32(self.q_scale) * per_dim
+        key_states = key_states * jnp.float32(self.k_scale)
+
+        # Block / context decomposition.
+        query_states = self._convert_to_block(query_states)  # (B, NB, chunk, H, D)
+        key_states = self._extract_block_context(key_states)  # (B, NB, context, H, D)
+        value_states = self._extract_block_context(value_states)  # (B, NB, context, H, D)
+        num_blocks = query_states.shape[1]
+
+        # Relative-position keys: (1, 13, H*D) -> (13, H, D), in fp32.
+        relative_key_states = self.relative_k_proj(position_embeddings)
+        relative_key_states = relative_key_states.reshape(-1, self.num_heads, self.head_dim).astype(jnp.float32)
+
+        # Permute queries to (B, H, NB, chunk, D) for batched matmul.
+        queries = jnp.transpose(query_states, (0, 3, 1, 2, 4))
+
+        # matrix_ac = queries @ keys^T per block, per head.
+        # keys.permute(0,3,1,4,2) -> (B, H, NB, D, context).
+        keys_t = jnp.transpose(key_states, (0, 3, 1, 4, 2))
+        matrix_ac = jnp.matmul(queries, keys_t)  # (B, H, NB, chunk, context)
+
+        # matrix_bd: queries vs. relative-position keys, broadcast over heads.
+        # queries_flat: (B, H, NB*chunk, D); rel_k.permute(1,2,0): (H, D, 13).
+        queries_flat = queries.reshape(batch_size, self.num_heads, -1, self.head_dim)
+        rel_k_t = jnp.transpose(relative_key_states, (1, 2, 0))  # (H, D, 13)
+        matrix_bd = jnp.matmul(queries_flat, rel_k_t)  # (B, H, NB*chunk, 13)
+        matrix_bd = matrix_bd.reshape(batch_size, self.num_heads, num_blocks, self.chunk_size, -1)
+        matrix_bd = self._rel_shift(matrix_bd)  # (B, H, NB, chunk, context)
+
+        # Softcap BEFORE mask.
+        attn_weights = matrix_ac + matrix_bd
+        attn_weights = attn_weights / jnp.float32(self.softcap)
+        attn_weights = jnp.tanh(attn_weights)
+        attn_weights = attn_weights * jnp.float32(self.softcap)
+
+        # Mask: True = attend, False = sentinel (matches HF logical_not flip).
+        if attention_mask is not None:
+            attn_weights = jnp.where(
+                attention_mask,
+                attn_weights,
+                jnp.float32(self.config.attention_invalid_logits_value),
+            )
+
+        # Softmax in fp32.
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1).astype(value_states.dtype)
+
+        # values.permute(0,3,1,2,4) -> (B, H, NB, context, D).
+        values_t = jnp.transpose(value_states, (0, 3, 1, 2, 4))
+        attn_output = jnp.matmul(attn_weights, values_t)  # (B, H, NB, chunk, D)
+
+        # (B, H, NB, chunk, D) -> (B, NB, chunk, H, D) -> (B, NB*chunk, H*D).
+        attn_output = jnp.transpose(attn_output, (0, 2, 3, 1, 4))
+        attn_output = attn_output.reshape(batch_size, num_blocks * self.chunk_size, self.num_heads * self.head_dim)
+
+        # Strip the chunk-pad rows.
+        attn_output = attn_output[:, :seq_length]
+
+        # Cast back to the post-projection kernel dtype (HF parity), then
+        # apply the clippable output projection.
+        attn_output = attn_output.astype(self.post.linear.kernel.value.dtype)
+        attn_output = self.post(attn_output)
+
+        return attn_output, attn_weights
