@@ -32,11 +32,14 @@ Classes land in the order specified by the port plan (lowest risk first):
    input/output clamp buffers. **Landed.**
 3. :class:`Gemma4AudioFeedForward` — Macaron FFN with pre+post RMSNorm and
    residual half-step (``residual_weight=0.5``). **Landed.**
-4. ``Gemma4AudioLightConv1d`` — TBD
-5. ``Gemma4AudioSubSampleConvProjection`` — TBD
-6. ``Gemma4AudioAttention`` — TBD
-7. ``Gemma4AudioLayer`` — TBD
-8. ``Gemma4AudioModel`` — TBD
+4. :class:`Gemma4AudioCausalConv1d` — left-padded depthwise-capable 1-D
+   convolution used inside the light-conv module. **Landed.**
+5. :class:`Gemma4AudioLightConv1d` — GLU + depthwise causal conv + residual
+   (Macaron companion to the FFN). **Landed.**
+6. ``Gemma4AudioSubSampleConvProjection`` — TBD
+7. ``Gemma4AudioAttention`` — TBD
+8. ``Gemma4AudioLayer`` — TBD
+9. ``Gemma4AudioModel`` — TBD
 """
 
 from __future__ import annotations
@@ -315,4 +318,187 @@ class Gemma4AudioFeedForward(nn.Module):
         hidden_states = hidden_states * self.post_layer_scale
         hidden_states = hidden_states + residual
 
+        return hidden_states
+
+
+class Gemma4AudioCausalConv1d(nn.Module):
+    """Left-padded 1-D convolution — the causal variant used in light-conv blocks.
+
+    Direct port of HF's ``Gemma4AudioCausalConv1d``, which subclasses
+    ``nn.Conv1d`` and overrides ``forward`` to left-pad the input sequence
+    before invoking the parent convolution. The HF version derives
+    ``left_pad`` from the dilated kernel size minus the stride so the
+    computation works for non-default strides/dilations too:
+
+    .. code-block:: python
+
+        left_pad = (kernel_size - 1) * dilation + 1 - stride
+
+    For the default ``conv_kernel_size=5`` (stride=1, dilation=1) this is
+    simply ``kernel - 1 = 4``.
+
+    Layout notes for the JAX port
+    -----------------------------
+    * HF's convolution operates on ``(N, C, L)`` and wraps the input in
+      ``F.pad(x, (left_pad, 0))`` (last-dim pad in PyTorch = L-axis).
+    * Our JAX implementation uses ``(B, L, C)`` throughout — the natural
+      Flax layout — so we bypass the HF ``transpose(1,2)`` ping-pong in
+      :class:`Gemma4AudioLightConv1d`.
+    * ``flax.nnx.Conv`` accepts either VALID padding with manual left pad
+      (our choice) or ``padding=((left, right),)`` tuples. We pad manually
+      with ``jnp.pad`` so the left-pad is stateless and transparent when
+      debugging.
+    * HF stores the conv kernel as ``(out_channels, in_channels/groups,
+      kernel_size)``; ``nnx.Conv`` stores ``(kernel_size,
+      in_features/groups, out_features)``. The weight converter will
+      transpose at load time — the shape and semantics are equivalent.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        *,
+        stride: int = 1,
+        dilation: int = 1,
+        groups: int = 1,
+        use_bias: bool = True,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: nn.Rngs,
+    ):
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.dilation = dilation
+        # Matches HF's ``left_pad`` cached property.
+        self.left_pad = (kernel_size - 1) * dilation + 1 - stride
+
+        self.conv = nn.Conv(
+            in_features=in_channels,
+            out_features=out_channels,
+            kernel_size=(kernel_size,),
+            strides=(stride,),
+            kernel_dilation=(dilation,),
+            feature_group_count=groups,
+            padding="VALID",  # Manual left-pad handles causality.
+            use_bias=use_bias,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+    def __call__(self, x: Float[Array, "batch length channels"]) -> Array:
+        # Left-pad the length axis; leave batch and channel axes untouched.
+        x = jnp.pad(x, ((0, 0), (self.left_pad, 0), (0, 0)))
+        return self.conv(x)
+
+
+class Gemma4AudioLightConv1d(nn.Module):
+    """GLU-gated depthwise causal convolution — conformer light-conv block.
+
+    Direct port of HF's ``Gemma4AudioLightConv1d``. Adds a residual
+    around::
+
+        x -> pre_layer_norm(x)
+          -> linear_start(x)                  # hidden -> 2*hidden
+          -> GLU(x, dim=-1)                   # -> hidden (gated halves)
+          -> depthwise_causal_conv1d(x)       # along length axis
+          -> clamp(x, -G, +G)
+          -> conv_norm(x)
+          -> act_fn(x)                        # silu
+          -> linear_end(x)                    # hidden -> hidden
+          -> x + residual
+
+    Conformer-specific subtleties
+    -----------------------------
+    * **Gated Linear Unit (GLU) collapses ``2*hidden`` back to ``hidden``**
+      by splitting the last dim in half and multiplying by ``sigmoid(second
+      half)``. Equivalent to ``a * sigmoid(b)`` — but matching
+      PyTorch's ``F.glu(..., dim=-1)`` convention. Implemented inline
+      (``a * sigmoid(b)``) rather than via ``jax.nn.glu`` to avoid
+      coupling to any particular JAX-version alias.
+    * **Depthwise conv** (``groups = hidden_size``) — a per-channel 1-D
+      filter over the length axis. HF uses kernel size 5, default for
+      Gemma 4 audio.
+    * **Single, full residual** — unlike the Macaron FFN there is no 0.5
+      weight here. The light-conv block is the full residual.
+    * **Clamp + conv_norm is applied *after* the conv and *before* the
+      activation**, not symmetrically around the FFN. Order matters for
+      activation-bound accuracy.
+    * HF transposes ``(B,T,C) -> (B,C,T)`` before the conv and back after,
+      because its conv expects channels-first. Our JAX conv already runs
+      on channels-last ``(B,L,C)`` — we skip the transpose entirely.
+    """
+
+    def __init__(
+        self,
+        config: Gemma4AudioConfig,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: nn.Rngs,
+    ):
+        self.config = config
+
+        self.linear_start = Gemma4AudioClippableLinear(
+            config,
+            config.hidden_size,
+            config.hidden_size * 2,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.linear_end = Gemma4AudioClippableLinear(
+            config,
+            config.hidden_size,
+            config.hidden_size,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        # Depthwise: groups == hidden_size so each channel has its own filter.
+        self.depthwise_conv1d = Gemma4AudioCausalConv1d(
+            in_channels=config.hidden_size,
+            out_channels=config.hidden_size,
+            kernel_size=config.conv_kernel_size,
+            groups=config.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        self.pre_layer_norm = Gemma4RMSNorm(config, param_dtype=param_dtype)
+        self.conv_norm = Gemma4RMSNorm(config, param_dtype=param_dtype)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+        # Same finfo-clamp rationale as Gemma4AudioFeedForward.
+        self.gradient_clipping = float(min(config.gradient_clipping, float(jnp.finfo(param_dtype).max)))
+
+    def __call__(self, hidden_states: Float[Array, "batch seq hidden"]) -> Float[Array, "batch seq hidden"]:
+        residual = hidden_states
+
+        hidden_states = self.pre_layer_norm(hidden_states)
+        hidden_states = self.linear_start(hidden_states)
+        # GLU over last axis: (..., 2H) -> (..., H). Split then multiply
+        # first half by sigmoid(second half); matches torch F.glu.
+        gate, value = jnp.split(hidden_states, 2, axis=-1)
+        hidden_states = gate * jax.nn.sigmoid(value)
+
+        # Depthwise causal conv runs on (B, L, C) directly — no transpose needed.
+        hidden_states = self.depthwise_conv1d(hidden_states)
+
+        hidden_states = jnp.clip(hidden_states, -self.gradient_clipping, self.gradient_clipping)
+        hidden_states = self.conv_norm(hidden_states)
+
+        hidden_states = self.act_fn(hidden_states)
+        hidden_states = self.linear_end(hidden_states)
+        hidden_states = hidden_states + residual
         return hidden_states
