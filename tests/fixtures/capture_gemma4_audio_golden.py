@@ -106,20 +106,46 @@ def _synth_waveform(
 # ------------------------------------------------------------------ capture
 
 
-def _tree_to_numpy(x):
-    """Recursively convert torch tensors in (tuple | list | dict | tensor) to
-    numpy arrays. Everything lands as float32 on disk; we don't want to bake
-    a dtype choice (bf16 is not losslessly representable as numpy) into the
-    fixtures — the JAX side can cast on load."""
-    import torch
+def _flatten_to_arrays(payload, prefix: str = "") -> dict[str, "np.ndarray"]:
+    """Flatten an arbitrarily-nested (tensor | tuple | list | dict | dataclass)
+    payload into a flat ``{dotted_name: ndarray}`` mapping suitable for
+    ``np.savez``. Non-tensor leaves (``None``, scalars) are dropped with a
+    debug note recorded on the caller's side.
 
-    if isinstance(x, torch.Tensor):
-        return x.detach().to(torch.float32).cpu().numpy()
-    if isinstance(x, dict):
-        return {k: _tree_to_numpy(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple)):
-        return type(x)(_tree_to_numpy(v) for v in x)
-    return x
+    Tensors land as float32 on disk — we don't want to bake a dtype choice
+    (bf16 isn't losslessly numpy-representable) into the fixtures; the JAX
+    side casts on load per the tolerance contract.
+    """
+    import torch
+    from dataclasses import is_dataclass, asdict
+
+    def _key(k):
+        return f"{prefix}.{k}" if prefix else str(k)
+
+    if isinstance(payload, torch.Tensor):
+        return {prefix or "data": payload.detach().to(torch.float32).cpu().numpy()}
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        out: dict[str, np.ndarray] = {}
+        for k, v in payload.items():
+            out.update(_flatten_to_arrays(v, _key(k)))
+        return out
+    if isinstance(payload, (list, tuple)):
+        out = {}
+        for i, v in enumerate(payload):
+            out.update(_flatten_to_arrays(v, _key(i)))
+        return out
+    if is_dataclass(payload):
+        return _flatten_to_arrays(asdict(payload), prefix)
+    # HF ModelOutput (OrderedDict-like): iterate items if possible.
+    if hasattr(payload, "items"):
+        return _flatten_to_arrays(dict(payload.items()), prefix)
+    # Unknown type — store a numpy-cast scalar if possible, else drop.
+    try:
+        return {prefix or "data": np.asarray(payload)}
+    except Exception:
+        return {}
 
 
 def _sha256_of_path(path: Path) -> str:
@@ -148,10 +174,12 @@ def capture(
     # ---- fixture input --------------------------------------------------
     waveform = _synth_waveform(seconds=10.0, sample_rate=16_000, seed=seed)
 
-    processor = transformers.AutoProcessor.from_pretrained(model_id)
-    # Audio-only path: use the feature extractor directly so we don't need a
-    # text prompt / image.
-    fe = getattr(processor, "feature_extractor", None) or processor
+    # Load the audio feature extractor directly rather than the full
+    # AutoProcessor. The processor pulls in image + video processors (and
+    # therefore Pillow + torchvision + decord) even when we only touch
+    # audio; going via the feature extractor keeps the dependency surface
+    # small and lets ``--audio-only`` stay MacBook-runnable.
+    fe = transformers.AutoFeatureExtractor.from_pretrained(model_id)
     audio_inputs = fe(
         [waveform],
         sampling_rate=16_000,
@@ -268,7 +296,15 @@ def capture(
 
     # ---- dump -----------------------------------------------------------
     def _save(name: str, payload):
-        np.savez(out_dir / f"{name}.npz", **{"data": _tree_to_numpy(payload)})
+        """Serialise any nested (tensor | tuple | dict | dataclass) to a single
+        ``.npz``. Nested structure is encoded in dotted keys inside the archive
+        (e.g. ``audio_tower_out.npz`` may contain ``last_hidden_state`` and
+        ``attention_mask`` as sibling arrays)."""
+        arrays = _flatten_to_arrays(payload)
+        if not arrays:
+            print(f"[capture] WARN: {name} produced no numpy arrays; skipped")
+            return
+        np.savez(out_dir / f"{name}.npz", **arrays)
 
     for name, val in captured.items():
         _save(name, val)
@@ -306,23 +342,32 @@ def capture(
 
 
 def _config_digest(config) -> dict:
-    """Extract the audio-relevant config fields into a plain dict for meta."""
+    """Extract the audio-relevant config fields into a plain dict for meta.
+
+    Key names mirror ``Gemma4AudioConfig`` in HF ``transformers`` 5.6+. They
+    are the architectural knobs the JAX port must round-trip; diffing this
+    dict across reruns is the cheapest drift signal.
+    """
     ac = getattr(config, "audio_config", None)
     if ac is None:
         return {}
     keys = [
+        "model_type",
         "hidden_size",
         "num_hidden_layers",
         "num_attention_heads",
-        "intermediate_size",
-        "num_mel_bins",
-        "chunk_size",
+        "hidden_act",
+        "subsampling_conv_channels",
+        "conv_kernel_size",
+        "residual_weight",
+        "attention_chunk_size",
         "attention_context_left",
         "attention_context_right",
-        "sscp_conv_channel_size",
-        "conf_num_hidden_layers",
-        "conf_conv_kernel_size",
-        "model_type",
+        "attention_logit_cap",
+        "attention_invalid_logits_value",
+        "use_clipped_linears",
+        "rms_norm_eps",
+        "output_proj_dims",
     ]
     return {k: getattr(ac, k, None) for k in keys}
 
