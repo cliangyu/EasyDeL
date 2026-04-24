@@ -3003,31 +3003,78 @@ class Gemma4Model(EasyDeLBaseModule):
             f"`{self._missing_vision_backend_model_type or self.config.vision_config.model_type}`."
         )
 
+    def get_audio_features(
+        self,
+        input_features: Array,
+        input_features_mask: Array | None = None,
+    ) -> tuple[Array, Array]:
+        """Encode audio mel features and project them into text embedding space.
+
+        Mirrors HF's ``Gemma4Model.get_audio_features``: runs the USM-style
+        conformer audio tower then the ``embed_audio`` multimodal projector.
+        The encoder also returns a downsampled validity mask (one bool per
+        post-SSCP frame) which the caller uses to skip padded audio slots
+        when scattering features into the text embedding stream.
+
+        Args:
+            input_features: ``(B, T_mel, F_mel)`` log-mel spectrogram.
+            input_features_mask: ``(B, T_mel)`` bool/float mask, ``True``/1
+                for valid mel frames. Optional — if ``None`` every frame is
+                treated as valid.
+
+        Returns:
+            ``(audio_features, output_mask)`` where ``audio_features`` has
+            shape ``(B, T_mel/4, text_hidden_size)`` and ``output_mask``
+            has shape ``(B, T_mel/4)`` bool.
+        """
+        self._require_audio_tower()
+        last_hidden_state, output_mask = self.audio_tower(
+            input_features=input_features,
+            input_features_mask=input_features_mask,
+        )
+        audio_features = self.embed_audio(last_hidden_state)
+        return audio_features, output_mask
+
     def compute_embedding(
         self,
         input_ids: Array,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        input_features: Array | None = None,
+        input_features_mask: Array | None = None,
     ) -> Array:
-        """Compute text embeddings and merge vision features at placeholder positions.
+        """Compute text embeddings and merge vision/audio features at placeholders.
 
         Token embeddings are looked up and scaled by ``sqrt(hidden_size)``.
-        If ``pixel_values`` are provided, the vision tower encodes them into
-        features which are projected into the text embedding space and inserted
-        at positions where ``input_ids == config.image_token_id``.
+        Optional modalities are then merged in HF's order — image, audio:
 
-        The merging uses a cumsum-based algorithm: a boolean mask identifies
-        image token positions, and ``cumsum`` over that mask creates gather
-        indices that map each placeholder to the corresponding vision feature.
+        * ``pixel_values`` (when present): vision tower → ``embed_vision`` →
+          scattered at ``input_ids == config.image_token_id`` positions.
+        * ``input_features`` (when present): audio tower → ``embed_audio`` →
+          scattered at ``input_ids == config.audio_token_id`` positions.
+
+        Both merges use a cumsum-based gather: a boolean placeholder mask
+        plus a running count assigns the k-th placeholder the k-th feature.
+        For audio, the encoder's downsampled validity mask is applied first
+        so padded mel frames don't pollute the gather.
+
+        Audio merging assumes the data pipeline aligned the placeholder
+        count with the count of valid post-SSCP frames per batch element
+        (mirroring HF's pre-scatter strip ``audio_features[output_mask]``).
+        Asymmetric padding inside the placeholder block is not supported
+        in this v0.
 
         Args:
             input_ids: Token IDs ``[batch, seq_len]``.
-            pixel_values: Image pixel values for the vision encoder, or ``None``
-                for text-only inputs.
+            pixel_values: Image pixel values for the vision encoder, or ``None``.
+            image_position_ids: Optional 2-D image position ids.
+            input_features: ``(B, T_mel, F_mel)`` log-mel spectrogram, or ``None``.
+            input_features_mask: ``(B, T_mel)`` mel validity mask, or ``None``.
 
         Returns:
-            Merged embeddings ``[batch, seq_len, hidden_size]`` with vision
-            features at image token positions and text embeddings elsewhere.
+            Merged embeddings ``[batch, seq_len, hidden_size]`` with vision /
+            audio features placed at their respective placeholder positions
+            and text embeddings elsewhere.
         """
         inputs_embeds = self.language_model.embed_tokens(input_ids.astype("i4")) * (
             self.config.text_config.hidden_size**0.5
@@ -3042,27 +3089,74 @@ class Gemma4Model(EasyDeLBaseModule):
             image_features = self.embed_vision(vision_outputs.last_hidden_state)
             image_features = image_features.astype(inputs_embeds.dtype)
 
-            special_image_mask = (input_ids == self.config.image_token_id).astype(jnp.int32)
-            image_features_flat = image_features.reshape(-1, image_features.shape[-1])
+            inputs_embeds = self._scatter_features_at_token(
+                inputs_embeds=inputs_embeds,
+                input_ids=input_ids,
+                features=image_features,
+                token_id=self.config.image_token_id,
+            )
 
-            cumsum = jnp.cumsum(special_image_mask.reshape(-1), axis=0)
-            gather_indices = jnp.where(
-                special_image_mask.reshape(-1),
-                cumsum - 1,
-                0,
+        if input_features is not None:
+            audio_features, audio_output_mask = self.get_audio_features(
+                input_features=input_features,
+                input_features_mask=input_features_mask,
             )
-            image_features_at_pos = jnp.where(
-                special_image_mask.reshape(-1)[:, None],
-                image_features_flat[gather_indices],
-                jnp.zeros((1, image_features.shape[-1]), dtype=inputs_embeds.dtype),
-            )
-            inputs_embeds = jnp.where(
-                special_image_mask[:, :, None],
-                image_features_at_pos.reshape(inputs_embeds.shape),
-                inputs_embeds,
+            audio_features = audio_features.astype(inputs_embeds.dtype)
+            # Zero out padded post-SSCP frames so the gather skips them and
+            # placeholder #k always pulls the k-th *valid* feature.
+            audio_features = audio_features * audio_output_mask[..., None].astype(audio_features.dtype)
+
+            inputs_embeds = self._scatter_features_at_token(
+                inputs_embeds=inputs_embeds,
+                input_ids=input_ids,
+                features=audio_features,
+                token_id=self.config.audio_token_id,
             )
 
         return inputs_embeds
+
+    @staticmethod
+    def _scatter_features_at_token(
+        inputs_embeds: Array,
+        input_ids: Array,
+        features: Array,
+        token_id: int,
+    ) -> Array:
+        """Cumsum-gather scatter of soft-token features into placeholder slots.
+
+        Shared kernel used by both image and audio merging: builds
+        ``mask = (input_ids == token_id)`` and assigns the k-th placeholder
+        the k-th feature drawn from ``features.reshape(-1, D)``. Positions
+        not flagged by ``mask`` keep their original ``inputs_embeds`` value.
+
+        Args:
+            inputs_embeds: Current ``(B, L, D)`` text embedding stream.
+            input_ids: ``(B, L)`` token ids — only the comparison with
+                ``token_id`` is used.
+            features: ``(B, T_features, D)`` soft tokens to scatter. Must
+                have the same hidden dim as ``inputs_embeds``.
+            token_id: Placeholder integer id (e.g. ``image_token_id`` or
+                ``audio_token_id``).
+
+        Returns:
+            New ``(B, L, D)`` embedding stream with ``features`` placed at
+            placeholder positions.
+        """
+        special_mask = (input_ids == token_id).astype(jnp.int32)
+        features_flat = features.reshape(-1, features.shape[-1])
+
+        cumsum = jnp.cumsum(special_mask.reshape(-1), axis=0)
+        gather_indices = jnp.where(special_mask.reshape(-1), cumsum - 1, 0)
+        features_at_pos = jnp.where(
+            special_mask.reshape(-1)[:, None],
+            features_flat[gather_indices],
+            jnp.zeros((1, features.shape[-1]), dtype=inputs_embeds.dtype),
+        )
+        return jnp.where(
+            special_mask[:, :, None],
+            features_at_pos.reshape(inputs_embeds.shape),
+            inputs_embeds,
+        )
 
     def _compute_per_layer_inputs(self, input_ids: Array | None) -> Array | None:
         """Build per-layer inputs while masking multimodal placeholder tokens."""
@@ -3072,6 +3166,8 @@ class Gemma4Model(EasyDeLBaseModule):
         multimodal_mask = input_ids == self.config.image_token_id
         if self.config.video_token_id is not None:
             multimodal_mask = multimodal_mask | (input_ids == self.config.video_token_id)
+        if self.config.audio_token_id is not None:
+            multimodal_mask = multimodal_mask | (input_ids == self.config.audio_token_id)
         safe_ids = jnp.where(multimodal_mask, self.config.text_config.pad_token_id, input_ids)
         return self.language_model.get_per_layer_inputs(safe_ids)
 
@@ -3080,10 +3176,18 @@ class Gemma4Model(EasyDeLBaseModule):
         input_ids: Array,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        input_features: Array | None = None,
+        input_features_mask: Array | None = None,
         **_kwargs,
     ) -> tuple[Array, EmbeddingInfo | None]:
         """Compute multimodal embeddings and preserve auxiliary per-layer inputs."""
-        inputs_embeds = self.compute_embedding(input_ids, pixel_values, image_position_ids=image_position_ids)
+        inputs_embeds = self.compute_embedding(
+            input_ids,
+            pixel_values,
+            image_position_ids=image_position_ids,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
+        )
         per_layer_inputs = self._compute_per_layer_inputs(input_ids)
         if per_layer_inputs is None:
             return inputs_embeds, None
@@ -3094,6 +3198,8 @@ class Gemma4Model(EasyDeLBaseModule):
         input_ids: Array | None = None,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        input_features: Array | None = None,
+        input_features_mask: Array | None = None,
         attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Array | None = None,
@@ -3108,21 +3214,23 @@ class Gemma4Model(EasyDeLBaseModule):
     ) -> BaseModelOutput:
         """Forward pass through the multimodal model.
 
-        If ``inputs_embeds`` is not provided, computes text+vision merged
-        embeddings via ``compute_embedding``. Per-layer inputs are computed
-        from the original ``input_ids`` with multimodal positions replaced by
-        the padding token ID.
+        If ``inputs_embeds`` is not provided, computes text + vision + audio
+        merged embeddings via ``compute_embedding``. Per-layer inputs are
+        computed from the original ``input_ids`` with multimodal positions
+        (image, video, audio) replaced by the padding token ID.
 
         Args:
             input_ids: Token IDs ``[batch, seq_len]``.
             pixel_values: Image data for the vision encoder.
+            image_position_ids: Optional 2-D image position ids.
+            input_features: ``(B, T_mel, F_mel)`` audio log-mel features.
+            input_features_mask: ``(B, T_mel)`` audio validity mask.
             attention_mask: Padding mask ``[batch, seq_len]``.
             mask_info: Pre-computed attention mask information.
             position_ids: Position indices ``[batch, seq_len]``.
             token_type_ids: Vision/text token type indicators.
-            per_layer_inputs: Optional pre-computed per-layer embeddings for the
-                text decoder.
-            inputs_embeds: Pre-computed embeddings (skips embedding computation).
+            per_layer_inputs: Optional pre-computed per-layer embeddings.
+            inputs_embeds: Pre-computed embeddings (skips embedding step).
             output_attentions: Return attention weights from all layers.
             output_hidden_states: Return hidden states from all layers.
             mode: Runtime execution mode.
@@ -3137,6 +3245,8 @@ class Gemma4Model(EasyDeLBaseModule):
                 input_ids,
                 pixel_values,
                 image_position_ids=image_position_ids,
+                input_features=input_features,
+                input_features_mask=input_features_mask,
             )
 
         if per_layer_inputs is None:
@@ -3246,25 +3356,48 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         )
         return self.base_model.embed_vision(vision_outputs.last_hidden_state)
 
+    def get_audio_features(
+        self,
+        input_features: Array,
+        input_features_mask: Array | None = None,
+    ) -> tuple[Array, Array]:
+        """Encode audio mel features and project them into text embedding space.
+
+        Thin pass-through to ``Gemma4Model.get_audio_features`` so callers
+        of the VLM front-end can extract audio soft tokens without reaching
+        through ``base_model``.
+        """
+        return self.base_model.get_audio_features(
+            input_features=input_features,
+            input_features_mask=input_features_mask,
+        )
+
     def compute_embedding(
         self,
         input_ids: Array,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        input_features: Array | None = None,
+        input_features_mask: Array | None = None,
     ) -> Array:
-        """Delegate to the base model's embedding computation with vision merging.
+        """Delegate to the base model's embedding computation with multimodal merging.
 
         Args:
             input_ids: Token IDs ``[batch, seq_len]``.
             pixel_values: Optional image data for the vision encoder.
+            image_position_ids: Optional 2-D image position ids.
+            input_features: ``(B, T_mel, F_mel)`` audio log-mel features.
+            input_features_mask: ``(B, T_mel)`` audio validity mask.
 
         Returns:
-            Merged text+vision embeddings ``[batch, seq_len, hidden_size]``.
+            Merged text+vision+audio embeddings ``[batch, seq_len, hidden_size]``.
         """
         return self.base_model.compute_embedding(
             input_ids,
             pixel_values,
             image_position_ids=image_position_ids,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
         )
 
     def compute_embedding_with_info(
@@ -3272,6 +3405,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         input_ids: Array,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        input_features: Array | None = None,
+        input_features_mask: Array | None = None,
         **kwargs,
     ) -> tuple[Array, EmbeddingInfo | None]:
         """Delegate multimodal embedding computation and auxiliary info to the base model."""
@@ -3279,6 +3414,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_position_ids=image_position_ids,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
             **kwargs,
         )
 
@@ -3318,6 +3455,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         input_ids: Array | None = None,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        input_features: Array | None = None,
+        input_features_mask: Array | None = None,
         attention_mask: Array | None = None,
         mask_info: MaskInfo | None = None,
         position_ids: Array | None = None,
@@ -3333,17 +3472,21 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
     ) -> VLMCausalLMOutput:
         """Forward pass through the vision-language model.
 
-        Runs the multimodal base model (vision encoding + text decoding) and
-        optionally applies the LM head to produce vocabulary logits.
+        Runs the multimodal base model (vision + audio encoding + text
+        decoding) and optionally applies the LM head to produce vocabulary
+        logits.
 
         Args:
             input_ids: Token IDs ``[batch, seq_len]``.
             pixel_values: Image data for the vision encoder.
+            image_position_ids: Optional 2-D image position ids.
+            input_features: ``(B, T_mel, F_mel)`` audio log-mel features.
+            input_features_mask: ``(B, T_mel)`` audio validity mask.
             attention_mask: Padding mask ``[batch, seq_len]``.
             mask_info: Pre-computed attention mask information.
             position_ids: Position indices ``[batch, seq_len]``.
             token_type_ids: Vision/text indicators for bidirectional masking.
-            inputs_embeds: Pre-computed embeddings (skips vision+text merge).
+            inputs_embeds: Pre-computed embeddings (skips multimodal merge).
             output_attentions: Return attention weights.
             output_hidden_states: Return intermediate hidden states.
             mode: Runtime execution mode.
@@ -3359,6 +3502,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_position_ids=image_position_ids,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
@@ -3385,23 +3530,27 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         )
 
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
-        """Strip vision-specific inputs after the first generation step.
+        """Strip multimodal-specific inputs after the first generation step.
 
-        After the initial prefill, vision features are cached in the KV states
-        and should not be re-processed. This removes ``pixel_values``,
-        ``token_type_ids``, and prompt-length auxiliary multimodal inputs such
-        as ``per_layer_inputs`` from the generation kwargs.
+        After the initial prefill, vision and audio features are baked into
+        the KV cache and the running ``input_ids`` no longer contains any
+        placeholder tokens, so re-feeding the raw multimodal arrays would be
+        both wasted work and a shape mismatch. This removes ``pixel_values``,
+        ``input_features``, ``token_type_ids``, and prompt-length auxiliary
+        inputs from the generation kwargs.
 
         Args:
             model_outputs: Outputs from the previous generation step.
             model_kwargs: Current generation keyword arguments.
 
         Returns:
-            Updated kwargs with vision inputs removed.
+            Updated kwargs with multimodal inputs removed.
         """
         model_kwargs = super().update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)
         model_kwargs.pop("image_position_ids", None)
+        model_kwargs.pop("input_features", None)
+        model_kwargs.pop("input_features_mask", None)
         model_kwargs.pop("token_type_ids", None)
         model_kwargs.pop("per_layer_inputs", None)
         return model_kwargs
