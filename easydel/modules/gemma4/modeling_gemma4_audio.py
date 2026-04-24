@@ -36,7 +36,10 @@ Classes land in the order specified by the port plan (lowest risk first):
    convolution used inside the light-conv module. **Landed.**
 5. :class:`Gemma4AudioLightConv1d` — GLU + depthwise causal conv + residual
    (Macaron companion to the FFN). **Landed.**
-6. ``Gemma4AudioSubSampleConvProjection`` — TBD
+6. :class:`Gemma4AudioSubSampleConvProjectionLayer` and
+   :class:`Gemma4AudioSubSampleConvProjection` — feature-extractor stem
+   that downsamples mel features 4x and projects to ``hidden_size``.
+   **Landed.**
 7. ``Gemma4AudioAttention`` — TBD
 8. ``Gemma4AudioLayer`` — TBD
 9. ``Gemma4AudioModel`` — TBD
@@ -54,6 +57,7 @@ from jaxtyping import Array, Float
 
 from easydel.infra.utils import ACT2FN
 from easydel.layers import ColumnParallelLinear
+from easydel.layers.norms import LayerNorm
 
 from .gemma4_configuration import Gemma4AudioConfig
 from .modeling_gemma4 import Gemma4RMSNorm
@@ -502,3 +506,190 @@ class Gemma4AudioLightConv1d(nn.Module):
         hidden_states = self.linear_end(hidden_states)
         hidden_states = hidden_states + residual
         return hidden_states
+
+
+class Gemma4AudioSubSampleConvProjectionLayer(nn.Module):
+    """Stride-2 Conv2d + LayerNorm + ReLU stem block.
+
+    Direct port of HF's ``Gemma4AudioSubSampleConvProjectionLayer``. Two of
+    these stack to give 4x temporal/spectral downsampling before the
+    conformer body. Mask-aware: padded timesteps in the input are zeroed
+    *before* the conv so they cannot leak into adjacent valid timesteps
+    via the kernel footprint, then the mask itself is downsampled by
+    stride-2 slicing.
+
+    Layout note: HF runs everything in NCHW and shuffles to channels-last
+    just for the LayerNorm. We use NHWC throughout (the natural Flax
+    layout), so the LayerNorm slot is a no-op transpose-wise.
+
+    Padding parity
+    --------------
+    HF uses ``padding=1`` (PyTorch symmetric pad). Flax's ``padding="SAME"``
+    can pad asymmetrically (e.g. left=0/right=1) when the spatial size
+    forces it, which would diverge from PyTorch on odd-length inputs.
+    We pin explicit ``((1, 1), (1, 1))`` padding to guarantee bit-level
+    parity with HF for any input size.
+
+    LayerNorm parity
+    ----------------
+    HF: ``nn.LayerNorm(out_channels, eps=norm_eps, elementwise_affine=True,
+    bias=False)`` — learned scale, no bias. We pass
+    ``use_scale=True, use_bias=False`` to match.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        norm_eps: float,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: nn.Rngs,
+    ):
+        self.conv = nn.Conv(
+            in_features=in_channels,
+            out_features=out_channels,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            padding=((1, 1), (1, 1)),  # explicit symmetric pad to match torch
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        # HF: LayerNorm with elementwise_affine=True, bias=False.
+        self.norm = LayerNorm(
+            num_features=out_channels,
+            epsilon=norm_eps,
+            use_scale=True,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            rngs=rngs,
+        )
+        # HF uses nn.ReLU; jax.nn.relu is the elementwise equivalent.
+        self.act = jax.nn.relu
+
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch height width channels"],
+        mask: Float[Array, "batch height"] | None = None,
+    ) -> tuple[Array, Array | None]:
+        if mask is not None:
+            # Broadcast over W and C so padded H positions get zeroed pre-conv.
+            hidden_states = hidden_states * mask[:, :, None, None]
+
+        hidden_states = self.conv(hidden_states)
+        # Channels-last NHWC: LayerNorm acts on the last axis directly,
+        # no transpose required.
+        hidden_states = self.act(self.norm(hidden_states))
+
+        if mask is not None:
+            # Match HF stride-2 slicing along the temporal (H) axis.
+            mask = mask[:, ::2]
+
+        return hidden_states, mask
+
+
+class Gemma4AudioSubSampleConvProjection(nn.Module):
+    """Mel-features -> conformer-input projection stem.
+
+    Direct port of HF's ``Gemma4AudioSubSampleConvProjection``. Two
+    stride-2 Conv2d layers give 4x downsampling on each spatial axis,
+    then a linear projects the flattened ``(F/4) * subsampling_conv_channels[1]``
+    vector to ``hidden_size``.
+
+    Forward (NHWC):
+
+    .. code-block:: text
+
+        (B, T, F)         input mel features
+        -> (B, T, F, 1)   add channel dim
+        -> layer0(.)      stride-2 Conv2d, in=1, out=conv_channels[0]
+        -> (B, T/2, F/2, conv_channels[0])
+        -> layer1(.)      stride-2 Conv2d, in=conv_channels[0], out=conv_channels[1]
+        -> (B, T/4, F/4, conv_channels[1])
+        -> reshape        (B, T/4, F/4 * conv_channels[1])
+        -> linear         (B, T/4, hidden_size)
+
+    Subtleties
+    ----------
+    * **proj_input_dim formula is HF-stale** — it computes
+      ``(subsampling_conv_channels[0] // 4) * subsampling_conv_channels[1]``,
+      which equals ``F/4 * conv_channels[1]`` *only* when the input mel
+      dimension equals ``conv_channels[0]`` (= 128 by default). The
+      formula is wrong for any other mel size, but mirroring HF preserves
+      checkpoint compatibility — the released E4B weights expect this
+      exact ``proj_input_dim``.
+    * **No clippable wrapper on ``input_proj_linear``** — HF uses a plain
+      ``nn.Linear``, so trained activation bounds do not apply here. We
+      use ``ColumnParallelLinear`` directly, matching the kernel-name
+      convention (``input_proj_linear.linear.kernel`` ↔ HF's
+      ``input_proj_linear.weight``).
+    * **Mask is downsampled by stride-2 slicing twice** giving (B, T/4)
+      after both layers. Downstream attention reads this final mask.
+    * **Channel dim added on the last axis** (NHWC). HF adds it on dim=1
+      (NCHW); our equivalent is ``hidden_states[..., None]``.
+    """
+
+    def __init__(
+        self,
+        config: Gemma4AudioConfig,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: nn.Rngs,
+    ):
+        self.config = config
+
+        self.layer0 = Gemma4AudioSubSampleConvProjectionLayer(
+            in_channels=1,
+            out_channels=config.subsampling_conv_channels[0],
+            norm_eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.layer1 = Gemma4AudioSubSampleConvProjectionLayer(
+            in_channels=config.subsampling_conv_channels[0],
+            out_channels=config.subsampling_conv_channels[1],
+            norm_eps=config.rms_norm_eps,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        # Mirror HF's stale formula exactly; required for checkpoint parity.
+        proj_input_dim = (config.subsampling_conv_channels[0] // 4) * config.subsampling_conv_channels[1]
+        kernel_init = jax.nn.initializers.normal(config.initializer_range)
+        self.input_proj_linear = ColumnParallelLinear(
+            proj_input_dim,
+            config.hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            rngs=rngs,
+        )
+
+    def __call__(
+        self,
+        input_features: Float[Array, "batch time freq"],
+        input_features_mask: Float[Array, "batch time"] | None = None,
+    ) -> tuple[Float[Array, "batch t4 hidden"], Array | None]:
+        # NHWC: add channel as the last axis -> (B, T, F, 1).
+        hidden_states = input_features[..., None]
+        hidden_states, mask = self.layer0(hidden_states, input_features_mask)
+        hidden_states, mask = self.layer1(hidden_states, mask)
+
+        batch_size, t4, f4, c4 = hidden_states.shape
+        # Flatten (F/4, C) -> (F/4 * C); already channels-last so no permute.
+        hidden_states = hidden_states.reshape(batch_size, t4, f4 * c4)
+        return self.input_proj_linear(hidden_states), mask
