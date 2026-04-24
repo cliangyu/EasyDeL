@@ -1,0 +1,43 @@
+name: Tests
+
+# Fires on every PR regardless of base branch, and on direct pushes to any
+# branch. The existing ``lint.yaml`` only runs for main/develop; this is the
+# one that gives feature-branch PRs feedback.
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+jobs:
+  hermetic:
+    name: hermetic tests + new-code lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+
+      - name: Install hermetic deps
+        run: |
+          python -m pip install --upgrade pip
+          # Only what the hermetic tests need. The heavy deps (JAX, flax,
+          # transformers, torch) are not installed — tests that require them
+          # should live outside the hermetic tree or skip when unavailable.
+          pip install ruff pytest numpy
+
+      - name: Ruff check (upstream easydel/ + tests/fixtures/)
+        run: |
+          ruff check easydel/ tests/fixtures/ --config pyproject.toml
+
+      - name: Ruff format check (tests/fixtures/)
+        run: |
+          ruff format --check tests/fixtures/ --config pyproject.toml
+
+      - name: Pytest — hermetic fixture shape contracts
+        run: |
+          pytest tests/fixtures/ -v
