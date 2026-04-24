@@ -43,7 +43,9 @@ Classes land in the order specified by the port plan (lowest risk first):
 7. :class:`Gemma4AudioAttention` — chunked local attention with Shaw-style
    relative position bias, fp32 islands, softplus per-head scale, softcap
    before mask. **Landed.**
-8. ``Gemma4AudioLayer`` — TBD
+8. :class:`Gemma4AudioLayer` — Macaron conformer block: FFN → norm-clamp →
+   self-attention → norm-clamp + residual → light-conv → FFN → norm-clamp.
+   **Landed.**
 9. ``Gemma4AudioModel`` — TBD
 """
 
@@ -1013,3 +1015,135 @@ class Gemma4AudioAttention(nn.Module):
         attn_output = self.post(attn_output)
 
         return attn_output, attn_weights
+
+
+class Gemma4AudioLayer(nn.Module):
+    """One conformer block of the audio tower.
+
+    Direct port of HF's ``Gemma4AudioLayer``. Each layer is a Macaron
+    conformer: two half-step feed-forward blocks sandwich a self-attention
+    block plus a depthwise GLU-conv block. Three RMSNorms — one before each
+    of the (attention, post-attention residual, output) stages — and a
+    *gradient_clipping* clamp before each norm act as activation guards.
+
+    Shape and dtype contract::
+
+        hidden_states : (B, T, hidden) float
+        position_embeddings : (1, 13, hidden) float (from RelPositionalEncoding)
+        attention_mask : (B, 1, NB, chunk, context) bool, optional
+
+    The block flow exactly mirrors HF (line numbers in
+    ``transformers/models/gemma4/modeling_gemma4.py``)::
+
+        x = feed_forward1(x)              # Macaron half (full block, *0.5 inside)
+        residual = x                      # snapshot AFTER the first FFN
+        x = clamp(x, ±G); x = norm_pre_attn(x)
+        x, _ = self_attn(x, position_embeddings, attention_mask)
+        x = clamp(x, ±G); x = norm_post_attn(x)
+        x = x + residual
+        x = lconv1d(x)                    # GLU + depthwise causal conv + residual
+        x = feed_forward2(x)              # Macaron half (full block, *0.5 inside)
+        x = clamp(x, ±G); x = norm_out(x)
+
+    Subtleties that must match HF for parity:
+
+    * The residual snapshot is taken **after** the first FFN, *not* on the
+      raw input. Both Macaron halves contribute their internal half-step
+      residual to their inputs; the *attention* sub-block's residual is
+      added at the explicit ``+= residual`` line on the post-attn-norm output.
+    * The light-conv block carries its own residual internally (see
+      :class:`Gemma4AudioLightConv1d`); the layer adds none on top.
+    * ``gradient_clipping`` floors at ``finfo(weight_dtype).max`` per HF —
+      the FFN already pre-computes this in init; we mirror it here so the
+      clamp magnitude exactly matches what the FFN sub-blocks use.
+    * Attention returns ``(out, weights)``; we discard the weights to keep
+      the layer signature identical to HF's (returns just ``hidden_states``).
+    """
+
+    def __init__(
+        self,
+        config: Gemma4AudioConfig,
+        layer_idx: int,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: nn.Rngs,
+    ):
+        self.config = config
+
+        self.feed_forward1 = Gemma4AudioFeedForward(
+            config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.feed_forward2 = Gemma4AudioFeedForward(
+            config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.self_attn = Gemma4AudioAttention(
+            config,
+            layer_idx=layer_idx,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.lconv1d = Gemma4AudioLightConv1d(
+            config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+
+        self.norm_pre_attn = Gemma4RMSNorm(config, param_dtype=param_dtype)
+        self.norm_post_attn = Gemma4RMSNorm(config, param_dtype=param_dtype)
+        self.norm_out = Gemma4RMSNorm(config, param_dtype=param_dtype)
+
+        # Pre-compute clamp bound the same way the FFN does, so attention
+        # input/output and FFN clamp magnitudes match byte-for-byte.
+        self.gradient_clipping = float(min(config.gradient_clipping, float(jnp.finfo(param_dtype).max)))
+
+    def __call__(
+        self,
+        hidden_states: Float[Array, "batch seq hidden"],
+        position_embeddings: Float[Array, "1 13 hidden"],
+        attention_mask: Array | None = None,
+    ) -> Float[Array, "batch seq hidden"]:
+        # Macaron half #1.
+        hidden_states = self.feed_forward1(hidden_states)
+        residual = hidden_states
+
+        # Pre-attn clamp + norm.
+        hidden_states = jnp.clip(hidden_states, -self.gradient_clipping, self.gradient_clipping)
+        hidden_states = self.norm_pre_attn(hidden_states)
+
+        # Self-attention. Drop the returned weights — HF only stores them via hooks.
+        hidden_states, _ = self.self_attn(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+        )
+
+        # Post-attn clamp + norm + residual add.
+        hidden_states = jnp.clip(hidden_states, -self.gradient_clipping, self.gradient_clipping)
+        hidden_states = self.norm_post_attn(hidden_states)
+        hidden_states = hidden_states + residual
+
+        # Light-conv block (carries its own residual internally).
+        hidden_states = self.lconv1d(hidden_states)
+
+        # Macaron half #2.
+        hidden_states = self.feed_forward2(hidden_states)
+
+        # Output clamp + norm.
+        hidden_states = jnp.clip(hidden_states, -self.gradient_clipping, self.gradient_clipping)
+        hidden_states = self.norm_out(hidden_states)
+
+        return hidden_states
