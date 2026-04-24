@@ -25,7 +25,7 @@ Gemma4 extends Gemma3 with:
 - Per-layer scalar weighting
 """
 
-from .gemma4_configuration import Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
+from .gemma4_configuration import Gemma4AudioConfig, Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 from .modeling_gemma4 import (
     Gemma4ForCausalLM,
     Gemma4ForConditionalGeneration,
@@ -37,6 +37,7 @@ from .modeling_gemma4 import (
 )
 
 __all__ = (
+    "Gemma4AudioConfig",
     "Gemma4Config",
     "Gemma4ForCausalLM",
     "Gemma4ForConditionalGeneration",

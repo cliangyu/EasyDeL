@@ -14,19 +14,21 @@
 
 """Configuration classes for the Gemma4 model family.
 
-This module defines the three configuration classes that parameterise every
+This module defines the four configuration classes that parameterise every
 component of the Gemma4 architecture:
 
 - ``Gemma4TextConfig``  — text decoder (attention, MLP, MoE, per-layer
   embeddings, KV sharing, RoPE, …).
 - ``Gemma4VisionConfig`` — vision encoder (patch embedding, spatial pooling,
   2-D RoPE, clipped linears, …).
-- ``Gemma4Config`` — top-level multimodal wrapper that bundles a text config,
-  an optional vision config, and special-token IDs for image/video merging.
+- ``Gemma4AudioConfig`` — USM-style conformer audio encoder (sub-sample conv
+  projection, Shaw-style relative position attention with chunked local
+  context, Macaron feed-forwards, depthwise light convolutions, …).
+- ``Gemma4Config`` — top-level multimodal wrapper that bundles the sub-configs
+  and special-token IDs for image/video/audio merging.
 
-All three classes inherit from ``EasyDeLBaseConfig`` and are registered with
-the EasyDeL factory so they can be instantiated via
-``AutoConfig.from_pretrained``.
+All classes inherit from ``EasyDeLBaseConfig`` and are registered with the
+EasyDeL factory so they can be instantiated via ``AutoConfig.from_pretrained``.
 """
 
 import typing
@@ -473,6 +475,132 @@ class Gemma4VisionConfig(EasyDeLBaseConfig):
         return None
 
 
+@register_config("gemma4_audio")
+class Gemma4AudioConfig(EasyDeLBaseConfig):
+    """Configuration for the Gemma4 USM-style audio encoder.
+
+    Parameterises a Conformer-like audio encoder that consumes log-mel
+    spectrogram features and produces a sequence of audio embeddings in the
+    LM's projector-input space. The encoder has three logical stages:
+
+    1. **Sub-sample Convolution Projection (SSCP).** Two stacked 2-D
+       convolutions (channel widths ``subsampling_conv_channels``, default
+       ``[128, 32]``) each with kernel 3×3 and stride 2×2, interleaved with
+       LayerNorm and ReLU, followed by a linear projection to
+       ``hidden_size``. This performs 4× temporal subsampling.
+    2. **Conformer stack.** ``num_hidden_layers`` (default 12) conformer
+       blocks with Macaron-style half-step residual feed-forwards, chunked
+       local self-attention with Shaw-style relative positional bias (chunk
+       size ``attention_chunk_size`` with ``attention_context_left`` /
+       ``attention_context_right``), and a depthwise *light* 1-D convolution
+       module (kernel ``conv_kernel_size``).
+    3. **Output projection.** A linear from ``hidden_size`` to
+       ``output_proj_dims`` that produces the tensor consumed by the
+       ``Gemma4MultimodalEmbedder``.
+
+    The attention block applies ``tanh(logits / attention_logit_cap) *
+    attention_logit_cap`` *before* the mask is applied, and uses the
+    ``attention_invalid_logits_value`` (default ``-1e9``) as the pre-softmax
+    masked fill. When ``use_clipped_linears=True`` every Linear clamps its
+    output to ``±gradient_clipping`` to match HF's trained stability path.
+
+    Args:
+        hidden_size: Hidden dimension throughout the conformer stack.
+            Defaults to 1024.
+        num_hidden_layers: Number of conformer blocks. Defaults to 12.
+        num_attention_heads: Number of attention heads per block.
+            Defaults to 8.
+        hidden_act: Activation name for the feed-forward blocks.
+            Defaults to ``"silu"``.
+        subsampling_conv_channels: Channel widths for the two SSCP conv
+            layers. Defaults to ``[128, 32]``. Tuples are converted to lists
+            so JSON round-trips cleanly (matches HF's ``__post_init__``).
+        conv_kernel_size: Kernel size of the depthwise light-conv module
+            inside each conformer block. Defaults to 5.
+        residual_weight: Scalar applied to the hidden state before combining
+            with the residual in each feed-forward half-step. Defaults to
+            0.5 (Macaron).
+        attention_chunk_size: Chunk size for local self-attention. Defaults
+            to 12.
+        attention_context_left: Leftward (past) context a chunk may attend
+            to. Defaults to 13.
+        attention_context_right: Rightward (future) context. Defaults to 0
+            (lookbehind-only).
+        attention_logit_cap: Softcap applied via ``tanh(x/c)*c`` before the
+            mask. Defaults to 50.0.
+        attention_invalid_logits_value: Pre-softmax value assigned to masked
+            positions. Defaults to ``-1e9``.
+        use_clipped_linears: If ``True``, Linear layers clamp their output
+            to ``±gradient_clipping``. Defaults to ``True``.
+        rms_norm_eps: Epsilon for RMSNorm layers. Defaults to 1e-6.
+        gradient_clipping: Symmetric clamp magnitude used by clipped
+            linears. Defaults to 1e10.
+        output_proj_dims: Output dimension of the final projection feeding
+            the multimodal embedder. Defaults to 1536.
+        initializer_range: Stddev for weight initialisation. Defaults to
+            0.02.
+        gradient_checkpointing: Gradient checkpointing strategy. Defaults
+            to ``NONE``.
+        bits: Quantisation bit-width. ``None`` disables quantisation.
+    """
+
+    model_type: str = "gemma4_audio"
+
+    def __init__(
+        self,
+        hidden_size: int = 1024,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 8,
+        hidden_act: str = "silu",
+        subsampling_conv_channels: list[int] | tuple[int, ...] = (128, 32),
+        conv_kernel_size: int = 5,
+        residual_weight: float = 0.5,
+        attention_chunk_size: int = 12,
+        attention_context_left: int = 13,
+        attention_context_right: int = 0,
+        attention_logit_cap: float = 50.0,
+        attention_invalid_logits_value: float = -1.0e9,
+        use_clipped_linears: bool = True,
+        rms_norm_eps: float = 1e-6,
+        gradient_clipping: float = 1e10,
+        output_proj_dims: int = 1536,
+        initializer_range: float = 0.02,
+        gradient_checkpointing: EasyDeLGradientCheckPointers = EasyDeLGradientCheckPointers.NONE,
+        bits: int | None = None,
+        **kwargs,
+    ):
+        self.gradient_checkpointing = gradient_checkpointing
+        self.bits = bits
+
+        super().__init__(bits=bits, **kwargs)
+
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.hidden_act = hidden_act
+        # Match HF's __post_init__ behaviour: tuples round-trip as lists.
+        self.subsampling_conv_channels = list(subsampling_conv_channels)
+        self.conv_kernel_size = conv_kernel_size
+        self.residual_weight = residual_weight
+        self.attention_chunk_size = attention_chunk_size
+        self.attention_context_left = attention_context_left
+        self.attention_context_right = attention_context_right
+        self.attention_logit_cap = attention_logit_cap
+        self.attention_invalid_logits_value = attention_invalid_logits_value
+        self.use_clipped_linears = use_clipped_linears
+        self.rms_norm_eps = rms_norm_eps
+        self.gradient_clipping = gradient_clipping
+        self.output_proj_dims = output_proj_dims
+        self.initializer_range = initializer_range
+
+    def get_partition_rules(self, *args, **kwargs) -> tuple[tuple[str, PartitionSpec], ...] | None:
+        """Return tensor-parallelism partition rules.
+
+        Returns ``None`` to use the default partitioning strategy.
+        """
+        return None
+
+
 @register_config("gemma4")
 class Gemma4Config(EasyDeLBaseConfig):
     """Top-level multimodal configuration for Gemma4.
@@ -484,10 +612,10 @@ class Gemma4Config(EasyDeLBaseConfig):
     sequence during multimodal embedding merging.
 
     When ``vision_config`` is ``None``, the model is instantiated without a
-    vision tower and can only process text inputs. Audio-specific config fields
-    are accepted and preserved so upstream Gemma 4 configs can round-trip
-    cleanly, even though EasyDeL's local Gemma 4 implementation does not yet
-    expose an audio tower.
+    vision tower. When ``audio_config`` is ``None`` the audio tower is also
+    disabled. Either config may be passed as a dictionary; dicts are unpacked
+    into the respective ``Gemma4VisionConfig`` / ``Gemma4AudioConfig``
+    constructors.
 
     Args:
         text_config: Configuration for the text decoder.  If ``None``, uses
@@ -521,13 +649,14 @@ class Gemma4Config(EasyDeLBaseConfig):
     sub_configs: typing.ClassVar = {
         "text_config": Gemma4TextConfig,
         "vision_config": Gemma4VisionConfig,
+        "audio_config": Gemma4AudioConfig,
     }
 
     def __init__(
         self,
         text_config: Gemma4TextConfig | dict | None = None,
         vision_config: Gemma4VisionConfig | dict | None = None,
-        audio_config: dict | None = None,
+        audio_config: Gemma4AudioConfig | dict | None = None,
         boi_token_id: int = 255_999,
         eoi_token_id: int = 258_882,
         image_token_id: int = 258_880,
@@ -547,9 +676,12 @@ class Gemma4Config(EasyDeLBaseConfig):
         if isinstance(vision_config, dict):
             vision_config = Gemma4VisionConfig(**vision_config)
 
+        if isinstance(audio_config, dict):
+            audio_config = Gemma4AudioConfig(**audio_config)
+
         self.text_config = text_config
         self.vision_config = vision_config
-        self.audio_config = dict(audio_config) if isinstance(audio_config, dict) else audio_config
+        self.audio_config = audio_config
         self.boi_token_id = boi_token_id
         self.eoi_token_id = eoi_token_id
         self.image_token_id = image_token_id
