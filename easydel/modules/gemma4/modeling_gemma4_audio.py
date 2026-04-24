@@ -28,7 +28,8 @@ Classes land in the order specified by the port plan (lowest risk first):
 
 1. :class:`Gemma4AudioRelPositionalEncoding` — sinusoidal Shaw-style relative
    position embedding (pure math, no learnable parameters). **Landed.**
-2. ``Gemma4AudioClippableLinear`` — TBD
+2. :class:`Gemma4AudioClippableLinear` — linear with optional per-layer
+   input/output clamp buffers. **Landed.**
 3. ``Gemma4AudioFeedForward`` — TBD
 4. ``Gemma4AudioLightConv1d`` — TBD
 5. ``Gemma4AudioSubSampleConvProjection`` — TBD
@@ -41,9 +42,13 @@ from __future__ import annotations
 
 import math
 
+import jax
 import jax.numpy as jnp
+from eformer.common_types import Replicated
 from flax import nnx as nn
 from jaxtyping import Array, Float
+
+from easydel.layers import ColumnParallelLinear
 
 from .gemma4_configuration import Gemma4AudioConfig
 
@@ -113,3 +118,96 @@ class Gemma4AudioRelPositionalEncoding(nn.Module):
         # Final shape (1, 13, hidden_size) with concatenated sin/cos halves.
         pos_embed = jnp.concatenate([jnp.sin(scaled_time), jnp.cos(scaled_time)], axis=-1)
         return pos_embed.astype(hidden_states.dtype)
+
+
+class Gemma4AudioClippableLinear(nn.Module):
+    """Linear with optional per-layer input/output activation clamping.
+
+    Direct port of HF's ``Gemma4ClippableLinear``. When
+    ``config.use_clipped_linears=True`` (the audio default; contrast with the
+    vision tower where it defaults ``False``), the forward pass sandwiches
+    the linear between two element-wise clamps:
+
+    .. code-block:: text
+
+        x -> clamp(x, input_min, input_max)
+          -> linear(x)                                 # bias=False
+          -> clamp(y, output_min, output_max)
+
+    The four clamp bounds are **scalar buffers** in HF — initialised to
+    ``±inf`` so that an untrained / freshly-loaded model produces a no-op
+    clamp, and overwritten with **trained bounds from the checkpoint** when
+    loading the released E4B weights. This matches the USM training
+    pipeline's practice of tracking activation percentiles as part of the
+    parameter set, analogous to how BatchNorm stores running stats.
+
+    Implementation notes:
+
+    * We use ``ColumnParallelLinear`` matching the style of
+      :class:`easydel.modules.gemma4.modeling_gemma4.Gemma4VisionClippableLinear`,
+      so the HF kernel name ``*.linear.weight`` maps to our ``*.linear.kernel``
+      via the standard EasyDeL weight-conversion path.
+    * The four clamp scalars are stored as ``nnx.Variable`` non-Param state,
+      not ``ArrayParam``. This keeps them out of the optimizer while still
+      being tracked by NNX so HF checkpoint conversion can overwrite them.
+      They map to HF buffer names ``input_min`` / ``input_max`` /
+      ``output_min`` / ``output_max`` — identical attribute names here.
+    * When ``use_clipped_linears=False`` the scalars are not registered at
+      all and the forward pass degenerates to a plain linear, matching HF.
+    * Biases are always off (HF hardcodes ``bias=False`` for every linear
+      in the audio tower).
+    """
+
+    def __init__(
+        self,
+        config: Gemma4AudioConfig,
+        in_features: int,
+        out_features: int,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: nn.Rngs,
+    ):
+        self.use_clipped_linears = config.use_clipped_linears
+
+        kernel_init = jax.nn.initializers.normal(config.initializer_range)
+        self.linear = ColumnParallelLinear(
+            in_features,
+            out_features,
+            use_bias=False,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            rngs=rngs,
+        )
+
+        if self.use_clipped_linears:
+            # Scalar buffers, ±inf by default — no-op clamp until a trained
+            # checkpoint overwrites them. Kept in param_dtype to match HF.
+            neg_inf = jnp.asarray(-jnp.inf, dtype=param_dtype)
+            pos_inf = jnp.asarray(jnp.inf, dtype=param_dtype)
+            self.input_min = nn.Variable(neg_inf)
+            self.input_max = nn.Variable(pos_inf)
+            self.output_min = nn.Variable(neg_inf)
+            self.output_max = nn.Variable(pos_inf)
+
+    def craft_sharding(self, *, partition_manager=None, **_kwargs) -> dict[str, object]:
+        """Replicate the (tiny, scalar) clamp buffers across all devices."""
+        if not self.use_clipped_linears:
+            return {}
+        return {
+            "input_min": Replicated,
+            "input_max": Replicated,
+            "output_min": Replicated,
+            "output_max": Replicated,
+        }
+
+    def __call__(self, hidden_states: Array) -> Array:
+        if self.use_clipped_linears:
+            hidden_states = jnp.clip(hidden_states, self.input_min.value, self.input_max.value)
+        hidden_states = self.linear(hidden_states)
+        if self.use_clipped_linears:
+            hidden_states = jnp.clip(hidden_states, self.output_min.value, self.output_max.value)
+        return hidden_states
