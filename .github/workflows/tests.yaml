@@ -30,14 +30,23 @@ jobs:
           # should live outside the hermetic tree or skip when unavailable.
           pip install ruff pytest numpy
 
-      - name: Ruff check (upstream easydel/ + tests/fixtures/)
+      - name: Ruff check (upstream easydel/)
         run: |
-          ruff check easydel/ tests/fixtures/ --config pyproject.toml
+          ruff check easydel/ --config pyproject.toml
 
-      - name: Ruff format check (tests/fixtures/)
+      - name: Ruff check + format (tests/fixtures/, if present)
         run: |
-          ruff format --check tests/fixtures/ --config pyproject.toml
+          if [ -d tests/fixtures ]; then
+            ruff check tests/fixtures/ --config pyproject.toml
+            ruff format --check tests/fixtures/ --config pyproject.toml
+          else
+            echo "tests/fixtures/ not present on this branch — skipping."
+          fi
 
-      - name: Pytest — hermetic fixture shape contracts
+      - name: Pytest — hermetic fixture shape contracts (if present)
         run: |
-          pytest tests/fixtures/ -v
+          if [ -d tests/fixtures ]; then
+            pytest tests/fixtures/ -v
+          else
+            echo "tests/fixtures/ not present on this branch — skipping."
+          fi
