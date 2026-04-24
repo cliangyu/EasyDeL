@@ -64,8 +64,10 @@ def test_rel_pos_matches_numpy_reference(hidden_size: int) -> None:
 
     assert ed_out.shape == (1, 13, hidden_size)
     assert ed_out.shape == ref_out.shape
-    # sin/cos are IEEE-deterministic — this should be exact.
-    np.testing.assert_allclose(ed_out, ref_out, atol=0.0, rtol=0.0)
+    # sin/cos/exp are IEEE-correct but JAX's libm and numpy's libm can
+    # differ in last-bit rounding (especially on Apple Silicon Metal vs
+    # x86 SSE). 1e-6 is well within fp32 precision for transcendentals.
+    np.testing.assert_allclose(ed_out, ref_out, atol=1e-6, rtol=1e-5)
 
 
 def test_rel_pos_output_dtype_follows_input() -> None:

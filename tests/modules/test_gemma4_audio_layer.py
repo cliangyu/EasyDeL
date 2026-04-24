@@ -58,8 +58,10 @@ def _make_layer(
     *,
     hidden_size: int = 64,
     num_heads: int = 4,
+    # context_size = chunk + past + future must be >= 12 (rel-pos encoding
+    # has a hardcoded 13 positions; ``_rel_shift`` pads to ``context+1``).
     chunk: int = 4,
-    past: int = 5,
+    past: int = 8,
     future: int = 0,
 ):
     cfg = Gemma4AudioConfig(
@@ -83,7 +85,7 @@ def _make_layer(
 
 def test_output_shape_preserved() -> None:
     """(B, T, hidden) in -> (B, T, hidden) out."""
-    cfg, layer, pos_layer = _make_layer(hidden_size=64, num_heads=4, chunk=4, past=5)
+    cfg, layer, pos_layer = _make_layer(hidden_size=64, num_heads=4, chunk=4, past=8)
     B, T = 2, 12
     x = jax.random.normal(jax.random.key(1), (B, T, cfg.hidden_size), dtype=jnp.float32)
     pos = pos_layer(x)
@@ -93,7 +95,7 @@ def test_output_shape_preserved() -> None:
 
 def test_forward_is_finite() -> None:
     """Random init must not produce NaN/Inf through the full Macaron block."""
-    cfg, layer, pos_layer = _make_layer(hidden_size=32, num_heads=4, chunk=4, past=3)
+    cfg, layer, pos_layer = _make_layer(hidden_size=32, num_heads=4, chunk=4, past=8)
     x = jax.random.normal(jax.random.key(2), (1, 8, cfg.hidden_size), dtype=jnp.float32)
     pos = pos_layer(x)
     y = np.asarray(layer(x, pos))
@@ -146,7 +148,7 @@ def test_gradient_clipping_matches_ffn() -> None:
 
 def test_mask_is_forwarded_to_attention() -> None:
     """Passing a restrictive mask changes output vs. no-mask, proving plumbing."""
-    cfg, layer, pos_layer = _make_layer(hidden_size=32, num_heads=4, chunk=4, past=3)
+    cfg, layer, pos_layer = _make_layer(hidden_size=32, num_heads=4, chunk=4, past=8)
     B, T = 1, 8
     x = jax.random.normal(jax.random.key(3), (B, T, cfg.hidden_size), dtype=jnp.float32)
     pos = pos_layer(x)
@@ -156,7 +158,7 @@ def test_mask_is_forwarded_to_attention() -> None:
     # Build a mask that lets only the first context position through everywhere.
     NB = 2  # ceil(8 / 4)
     chunk = 4
-    context = 4 + 3 + 0  # = 7
+    context = 4 + 8 + 0  # = 12
     mask = jnp.zeros((B, 1, NB, chunk, context), dtype=jnp.bool_)
     mask = mask.at[:, :, :, :, 0].set(True)
     y_masked = np.asarray(layer(x, pos, attention_mask=mask))

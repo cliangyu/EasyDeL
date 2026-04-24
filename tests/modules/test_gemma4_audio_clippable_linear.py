@@ -107,9 +107,9 @@ def test_no_bias_param() -> None:
     _, layer = _make_layer(use_clipped_linears=True)
     # Parameter tree should contain the linear kernel but no bias.
     params = nn.state(layer, nn.Param).flat_state()
-    param_names = {k for k in params.keys()}
-    assert any("kernel" in str(k) for k in param_names), "missing linear kernel"
-    assert not any("bias" in str(k) for k in param_names), f"expected no bias in clippable linear, found {param_names}"
+    param_names = {"/".join(str(s) for s in path) for path, _ in params}
+    assert any("kernel" in n for n in param_names), "missing linear kernel"
+    assert not any("bias" in n for n in param_names), f"expected no bias in clippable linear, found {param_names}"
 
 
 def test_clipped_registers_four_bound_variables() -> None:

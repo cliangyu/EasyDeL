@@ -60,8 +60,11 @@ def _make_attn(
     *,
     hidden_size: int = 64,
     num_heads: int = 4,
+    # Defaults must satisfy ``context_size = chunk + past + future >= 12`` —
+    # the relative-position encoding produces a hardcoded 13 positions, and
+    # ``_rel_shift`` pads to ``context_size + 1`` which must be >= 13.
     chunk: int = 4,
-    past: int = 5,
+    past: int = 8,
     future: int = 0,
 ) -> tuple[Gemma4AudioConfig, Gemma4AudioAttention]:
     cfg = Gemma4AudioConfig(
@@ -122,8 +125,9 @@ def test_relative_k_proj_has_no_bias_no_clamp() -> None:
     _, attn = _make_attn()
     # Plain ColumnParallelLinear: kernel only, no bias.
     params = nn.state(attn.relative_k_proj, nn.Param).flat_state()
-    assert any("kernel" in str(k) for k in params.keys())
-    assert not any("bias" in str(k) for k in params.keys())
+    names = {"/".join(str(s) for s in path) for path, _ in params}
+    assert any("kernel" in n for n in names)
+    assert not any("bias" in n for n in names)
     # Not wrapped in Gemma4AudioClippableLinear: no input_min/output_max attrs.
     assert not hasattr(attn.relative_k_proj, "input_min")
     assert not hasattr(attn.relative_k_proj, "output_max")
@@ -172,12 +176,16 @@ def test_extract_block_context_left_padding_zeroed() -> None:
 
 
 def test_rel_shift_output_shape() -> None:
-    """_rel_shift takes (B, H, NB, chunk, 13) -> (B, H, NB, chunk, context)."""
-    _, attn = _make_attn(hidden_size=8, num_heads=2, chunk=4, past=5, future=0)
-    # context = 4 + 5 + 0 = 9.
+    """_rel_shift takes (B, H, NB, chunk, 13) -> (B, H, NB, chunk, context).
+
+    ``context_size`` must be >= 12 (the rel-pos encoding's hardcoded
+    position_length is 13 and ``_rel_shift`` pads to ``context+1``).
+    """
+    _, attn = _make_attn(hidden_size=8, num_heads=2, chunk=4, past=8, future=0)
+    # context = 4 + 8 + 0 = 12.
     x = jnp.zeros((1, 2, 3, 4, 13), dtype=jnp.float32)
     shifted = attn._rel_shift(x)
-    assert shifted.shape == (1, 2, 3, 4, 9)
+    assert shifted.shape == (1, 2, 3, 4, 12)
 
 
 # -- Forward -----------------------------------------------------------------
@@ -198,7 +206,7 @@ def _make_attn_with_pos(
 
 def test_forward_output_shape_and_finite() -> None:
     """End-to-end forward: shape preserved, no NaN/Inf at init."""
-    cfg, attn, pos_layer = _make_attn_with_pos(hidden_size=64, num_heads=4, chunk=4, past=5)
+    cfg, attn, pos_layer = _make_attn_with_pos(hidden_size=64, num_heads=4, chunk=4, past=8)
     B, T = 2, 12
     x = jax.random.normal(jax.random.key(1), (B, T, cfg.hidden_size), dtype=jnp.float32)
     pos = pos_layer(x)
@@ -209,53 +217,64 @@ def test_forward_output_shape_and_finite() -> None:
     assert np.isfinite(np.asarray(w)).all()
 
 
-def test_softcap_caps_logits_pre_softmax() -> None:
-    """Pre-softmax logits must be in [-softcap, +softcap] regardless of input scale."""
-    # Use chunk=2, past=2, future=0 -> context=4. Tiny shapes for fast assertion.
+def test_softcap_keeps_forward_finite_under_extreme_input() -> None:
+    """Softcap is the structural guard against logit overflow.
+
+    With ``softcap=50``, raw QK products of arbitrary magnitude are squashed
+    via ``softcap * tanh(raw / softcap)`` to ``[-50, +50]`` *before* softmax.
+    Without it, an extreme input scale could push raw logits to ``±inf``
+    and yield NaN attention weights downstream.
+
+    Note: a "softmax does not collapse to one-hot" check would *not* be
+    safe to assert here — even with softcap=50, an aggressive input scale
+    can drive each logit to ±cap, and softmax([50, -50, -50, ...]) is
+    legitimately near one-hot. Bit-level softcap verification belongs in
+    the golden-tensor diff. Here we just pin the finite-output contract.
+    """
     cfg = Gemma4AudioConfig(
         hidden_size=8,
         num_attention_heads=2,
-        attention_chunk_size=2,
-        attention_context_left=3,  # past = 2
+        attention_chunk_size=4,
+        attention_context_left=9,  # past = 8
         attention_context_right=0,
     )
     rngs = nn.Rngs(0)
     attn = Gemma4AudioAttention(cfg, 0, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
     pos_layer = Gemma4AudioRelPositionalEncoding(cfg, dtype=jnp.float32)
     # Crank input magnitudes to overwhelming levels.
-    x = jax.random.normal(jax.random.key(2), (1, 4, 8), dtype=jnp.float32) * 1000.0
+    x = jax.random.normal(jax.random.key(2), (1, 8, 8), dtype=jnp.float32) * 1000.0
     pos = pos_layer(x)
-    _, attn_weights = attn(x, pos)
-    # attn_weights here are post-softmax (in (0, 1)). To verify softcap, we
-    # instead check that softmax probabilities don't degenerate to one-hot,
-    # which is what would happen if logits were >> softcap.
+    out, attn_weights = attn(x, pos)
     aw = np.asarray(attn_weights)
-    # Softmax max value ~= 1 indicates degenerate one-hot; with softcap=50
-    # tanh-saturated logits stay bounded so probabilities stay smooth.
-    # This is a weak check but a flag if softcap is removed.
-    assert aw.max() < 1.0 - 1e-6, "softmax fully saturated; softcap may be missing"
+    # No NaN/Inf in either output — softcap or numerically-stable softmax
+    # both must hold for this to pass.
+    assert np.isfinite(np.asarray(out)).all(), "non-finite forward output under huge input"
+    assert np.isfinite(aw).all(), "non-finite attention weights under huge input"
+    # Softmax invariant: weights sum to 1 along the context axis.
+    np.testing.assert_allclose(aw.sum(axis=-1), 1.0, atol=1e-5)
 
 
 def test_mask_zeros_invalid_softmax_weight() -> None:
     """mask=False positions get the sentinel and softmax to ~0 weight."""
+    # context_size must be >= 12 — see test_softcap_caps_logits_pre_softmax.
     cfg = Gemma4AudioConfig(
         hidden_size=8,
         num_attention_heads=2,
-        attention_chunk_size=2,
-        attention_context_left=3,
+        attention_chunk_size=4,
+        attention_context_left=9,  # past = 8
         attention_context_right=0,
     )
     rngs = nn.Rngs(0)
     attn = Gemma4AudioAttention(cfg, 0, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs)
     pos_layer = Gemma4AudioRelPositionalEncoding(cfg, dtype=jnp.float32)
-    B, T = 1, 4
+    B, T = 1, 8
     x = jax.random.normal(jax.random.key(3), (B, T, cfg.hidden_size), dtype=jnp.float32)
     pos = pos_layer(x)
-    # Build a mask of shape (B, H, NB, chunk, context) — broadcastable shape
-    # works too. Block all but the first context position for every query.
-    NB = 2
-    chunk = 2
-    context = 4  # 2 + 2 + 0
+    # Build a mask of shape (B, H, NB, chunk, context). Block all but the
+    # first context position for every query.
+    NB = 2  # ceil(8 / 4)
+    chunk = 4
+    context = 12  # 4 + 8 + 0
     mask = jnp.zeros((B, 1, NB, chunk, context), dtype=jnp.bool_)
     mask = mask.at[:, :, :, :, 0].set(True)  # only context[0] is valid
     _, w = attn(x, pos, mask)

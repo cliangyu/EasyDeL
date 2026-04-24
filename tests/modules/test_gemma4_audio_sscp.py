@@ -134,7 +134,8 @@ def test_input_proj_linear_has_no_bias() -> None:
     """HF uses bias=False on input_proj_linear; port must match."""
     _, sscp = _make_sscp()
     params = nn.state(sscp.input_proj_linear, nn.Param).flat_state()
-    assert not any("bias" in str(k) for k in params.keys())
+    names = {"/".join(str(s) for s in path) for path, _ in params}
+    assert not any("bias" in n for n in names)
 
 
 def test_sub_layers_have_no_conv_bias() -> None:
@@ -143,7 +144,8 @@ def test_sub_layers_have_no_conv_bias() -> None:
     for layer_name in ("layer0", "layer1"):
         layer = getattr(sscp, layer_name)
         params = nn.state(layer.conv, nn.Param).flat_state()
-        assert not any("bias" in str(k) for k in params.keys()), f"{layer_name}.conv has a bias"
+        names = {"/".join(str(s) for s in path) for path, _ in params}
+        assert not any("bias" in n for n in names), f"{layer_name}.conv has a bias"
 
 
 # -- Mask zeroing happens BEFORE conv ----------------------------------------
@@ -205,6 +207,6 @@ def test_layer_norm_no_bias_with_scale() -> None:
         rngs=rngs,
     )
     params = nn.state(layer.norm, nn.Param).flat_state()
-    names = {str(k) for k in params.keys()}
+    names = {"/".join(str(s) for s in path) for path, _ in params}
     assert any("scale" in n for n in names), f"missing learned scale in {names}"
     assert not any("bias" in n for n in names), f"unexpected bias in {names}"
