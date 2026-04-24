@@ -113,6 +113,10 @@ from easydel.modules.auto.auto_modeling import AutoEasyDeLVisionModel
 
 from .gemma4_configuration import Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 
+# NOTE: ``modeling_gemma4_audio`` imports ``Gemma4RMSNorm`` from this module,
+# so we cannot import ``Gemma4AudioModel`` at module load time without a
+# circular import. We import it lazily inside ``Gemma4Model.__init__`` below.
+
 
 def _has_registered_gemma4_vision_backend(config: Gemma4VisionConfig | None) -> bool:
     """Return True when the configured Gemma4 vision encoder is registered."""
@@ -2951,6 +2955,42 @@ class Gemma4Model(EasyDeLBaseModule):
                 self._missing_vision_backend_model_type = config.vision_config.model_type
             self.vision_tower = None
             self.embed_vision = None
+
+        # ---- audio tower (USM-style conformer) -----------------------------
+        # Mirrors the vision branch above. HF state-dict prefix is
+        # ``model.audio_tower.*`` and ``model.embed_audio.*`` — registering
+        # both as direct submodules lets the standard EasyDeL HF→JAX converter
+        # walk the audio params automatically (RMSNorms, Linears, Conv1d/2d,
+        # and the four trained activation bounds per ClippableLinear).
+        if config.audio_config is not None:
+            from .modeling_gemma4_audio import Gemma4AudioModel
+
+            self.audio_tower = Gemma4AudioModel(
+                config=config.audio_config,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                precision=precision,
+                rngs=rngs,
+            )
+            self.embed_audio = Gemma4MultimodalEmbedder(
+                multimodal_hidden_size=config.audio_config.output_proj_dims,
+                text_hidden_size=config.text_config.hidden_size,
+                rms_norm_eps=config.audio_config.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=param_dtype,
+                rngs=rngs,
+            )
+        else:
+            self.audio_tower = None
+            self.embed_audio = None
+
+    def _require_audio_tower(self) -> None:
+        """Validate that an audio encoder is available for input_features."""
+        if self.audio_tower is not None:
+            return
+        if self.config.audio_config is None:
+            raise ValueError("Model was initialized without an audio config.")
+        raise NotImplementedError("Gemma4 audio inputs require ``config.audio_config`` to be set at construction time.")
 
     def _require_vision_tower(self) -> None:
         """Validate that a usable vision encoder is available for image inputs."""
