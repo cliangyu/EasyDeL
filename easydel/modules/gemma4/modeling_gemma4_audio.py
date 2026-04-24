@@ -46,7 +46,9 @@ Classes land in the order specified by the port plan (lowest risk first):
 8. :class:`Gemma4AudioLayer` — Macaron conformer block: FFN → norm-clamp →
    self-attention → norm-clamp + residual → light-conv → FFN → norm-clamp.
    **Landed.**
-9. ``Gemma4AudioModel`` — TBD
+9. :class:`Gemma4AudioModel` — full audio tower: SSCP stem → relative-pos
+   encoding + chunked-attention mask → ``num_hidden_layers`` conformer
+   layers → output projection (1024→1536). **Landed.**
 """
 
 from __future__ import annotations
@@ -1147,3 +1149,222 @@ class Gemma4AudioLayer(nn.Module):
         hidden_states = self.norm_out(hidden_states)
 
         return hidden_states
+
+
+class Gemma4AudioModel(nn.Module):
+    """USM-style conformer audio encoder — full tower.
+
+    Direct JAX port of HuggingFace's ``Gemma4AudioModel``. Forward pipeline::
+
+        input_features (B, T_mel, F_mel)  # log-mel spectrogram
+        + input_features_mask (B, T_mel)  # True = valid frame
+                |
+                v
+        SubSampleConvProjection         # 4x downsample in time, project to hidden
+                |
+        (hidden_states (B, T, hidden), output_mask (B, T))
+                |
+                v
+        rel_pos_enc(hidden_states) -> position_embeddings (1, 13, hidden)
+                |
+                v
+        attention_mask = build_chunked_5d_mask(output_mask)
+                |
+                v
+        for L layers: Gemma4AudioLayer(hidden_states, position_embeddings, mask)
+                |
+                v
+        output_proj(hidden_states)      # hidden -> output_proj_dims (1024 -> 1536)
+                |
+                v
+        return last_hidden_state, output_mask
+
+    The mask construction is the *only* novel logic in this class — every
+    other piece is already-tested. We re-implement HF's
+    ``create_bidirectional_mask + sliding_window_mask_function +
+    _convert_4d_mask_to_blocked_5d`` pipeline directly in JAX, matching the
+    upstream algorithm step-for-step:
+
+    1. Build a 4D bidirectional mask ``(B, 1, T, T)`` of valid (q, k) pairs
+       under both the padding mask AND the sliding window:
+       ``valid(b, q, k) = output_mask[b, q] & output_mask[b, k] &
+                           in_window(q - k)``
+       where ``in_window(d) = (0 <= d < past) | (-future < d < 0)``.
+       (Note STRICT inequality on both bounds — matches HF's
+       ``sliding_window_mask_function`` byte-for-byte.)
+    2. Pad the time axis up to a multiple of ``chunk_size`` (with False).
+    3. Reshape to ``(B, 1, NB, chunk, padded_T)`` of (block, query, key) layout.
+    4. Pad the key axis on the left by ``past`` and on the right by ``future``
+       so block ``b``'s keys ``[b·chunk - past, b·chunk + chunk + future)``
+       index into the padded array contiguously.
+    5. Gather the slice ``[b·chunk, b·chunk + context_size)`` for each block
+       to produce the final ``(B, 1, NB, chunk, context_size)`` mask.
+
+    The output ``output_mask`` (1D, downsampled by SSCP) is also returned
+    for downstream consumers — ``Gemma4MultimodalEmbedder`` uses it to
+    locate valid audio tokens when projecting into text-embedding space.
+    """
+
+    config: Gemma4AudioConfig
+
+    def __init__(
+        self,
+        config: Gemma4AudioConfig,
+        *,
+        dtype: jnp.dtype = jnp.bfloat16,
+        param_dtype: jnp.dtype = jnp.bfloat16,
+        precision: jax.lax.PrecisionLike = None,
+        rngs: nn.Rngs,
+    ):
+        self.config = config
+        self.dtype = dtype
+        self.param_dtype = param_dtype
+        self.precision = precision
+
+        self.subsample_conv_projection = Gemma4AudioSubSampleConvProjection(
+            config,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            rngs=rngs,
+        )
+        self.rel_pos_enc = Gemma4AudioRelPositionalEncoding(config, dtype=dtype)
+
+        self.layers = nn.List(
+            [
+                Gemma4AudioLayer(
+                    config,
+                    layer_idx=i,
+                    dtype=dtype,
+                    param_dtype=param_dtype,
+                    precision=precision,
+                    rngs=rngs,
+                )
+                for i in range(config.num_hidden_layers)
+            ]
+        )
+
+        # output_proj has bias=True in HF (the only audio-tower linear that does).
+        kernel_init = jax.nn.initializers.normal(config.initializer_range)
+        self.output_proj = ColumnParallelLinear(
+            config.hidden_size,
+            config.output_proj_dims,
+            use_bias=True,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            precision=precision,
+            kernel_init=kernel_init,
+            rngs=rngs,
+        )
+
+    # -- mask construction ---------------------------------------------------
+
+    def _build_chunked_5d_mask(self, output_mask: Array) -> Array:
+        """Bidirectional padding mask + sliding window, in 5D blocked layout.
+
+        Args:
+            output_mask: ``(B, T)`` bool — True = valid (post-SSCP downsampling).
+
+        Returns:
+            mask of shape ``(B, 1, NB, chunk, context_size)`` bool —
+            True = (q, k) is a valid attention pair.
+        """
+        chunk = self.config.attention_chunk_size
+        past = self.config.attention_context_left - 1
+        future = self.config.attention_context_right
+        context_size = chunk + past + future
+
+        batch_size, seq_len = output_mask.shape
+
+        # ---- step 1: 4D bidirectional mask with sliding window -------------
+        q_pos = jnp.arange(seq_len)[:, None]  # (T, 1)
+        k_pos = jnp.arange(seq_len)[None, :]  # (1, T)
+        dist = q_pos - k_pos  # (T, T)
+        # HF's sliding_window_mask_function: STRICT inequality on both sides.
+        left_window = (dist >= 0) & (dist < past)
+        right_window = (dist < 0) & (-dist < future)
+        window = left_window | right_window  # (T, T)
+
+        # Bidirectional padding: both query and key positions must be valid.
+        pad_mask = output_mask[:, :, None] & output_mask[:, None, :]  # (B, T, T)
+        mask_4d = (pad_mask & window[None, :, :])[:, None, :, :]  # (B, 1, T, T)
+
+        # ---- step 2: pad to chunk multiple, reshape to 5D blocked ---------
+        num_blocks = (seq_len + chunk - 1) // chunk
+        padded_seq_len = num_blocks * chunk
+        pad_amount = padded_seq_len - seq_len
+        if pad_amount > 0:
+            mask_4d = jnp.pad(
+                mask_4d,
+                ((0, 0), (0, 0), (0, pad_amount), (0, pad_amount)),
+                constant_values=False,
+            )
+        mask_5d = mask_4d.reshape(batch_size, 1, num_blocks, chunk, padded_seq_len)
+
+        # ---- step 3: pad key axis by (past, future) -----------------------
+        mask_5d = jnp.pad(
+            mask_5d,
+            ((0, 0), (0, 0), (0, 0), (0, 0), (past, future)),
+            constant_values=False,
+        )
+        # mask_5d now: (B, 1, NB, chunk, padded_seq_len + past + future)
+
+        # ---- step 4: gather block-relative key indices ---------------------
+        block_starts = jnp.arange(num_blocks) * chunk  # (NB,)
+        offsets = jnp.arange(context_size)  # (context_size,)
+        kv_indices = block_starts[:, None] + offsets[None, :]  # (NB, context_size)
+        # Broadcast to (B, 1, NB, chunk, context_size).
+        kv_indices = jnp.broadcast_to(
+            kv_indices[None, None, :, None, :],
+            (batch_size, 1, num_blocks, chunk, context_size),
+        )
+        return jnp.take_along_axis(mask_5d, kv_indices, axis=-1)
+
+    # -- forward -------------------------------------------------------------
+
+    def __call__(
+        self,
+        input_features: Float[Array, "batch t_mel f_mel"],
+        input_features_mask: Array | None = None,
+    ) -> tuple[Float[Array, "batch t hidden_out"], Array | None]:
+        """Encode audio mel features to text-embedding-space pre-projection vectors.
+
+        Args:
+            input_features: ``(B, T_mel, F_mel)`` log-mel spectrogram.
+            input_features_mask: ``(B, T_mel)`` float (1.0=valid) or bool, optional.
+
+        Returns:
+            ``(last_hidden_state, output_mask)`` where ``last_hidden_state``
+            has shape ``(B, T_mel/4, output_proj_dims)`` and ``output_mask``
+            has shape ``(B, T_mel/4)`` (or None if no input mask).
+        """
+        # SSCP downsamples 4x in time and projects to hidden_size.
+        hidden_states, output_mask = self.subsample_conv_projection(input_features, input_features_mask)
+
+        # Relative position embeddings: (1, 13, hidden_size). Independent of T.
+        position_embeddings = self.rel_pos_enc(hidden_states)
+
+        # Build chunked 5D attention mask (only when we have a 1D padding mask).
+        # If output_mask is None, every position is valid -> we still need the
+        # window structure to forbid attending outside the receptive field.
+        if output_mask is None:
+            output_mask = jnp.ones(hidden_states.shape[:2], dtype=jnp.bool_)
+        else:
+            # SSCP returns the mask as the same dtype as the input mask
+            # (typically float). Convert to bool — True = valid.
+            output_mask = output_mask.astype(jnp.bool_)
+
+        attention_mask = self._build_chunked_5d_mask(output_mask)
+
+        # Stack of conformer layers.
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+            )
+
+        # Final projection: hidden_size -> output_proj_dims (1024 -> 1536).
+        hidden_states = self.output_proj(hidden_states)
+
+        return hidden_states, output_mask
