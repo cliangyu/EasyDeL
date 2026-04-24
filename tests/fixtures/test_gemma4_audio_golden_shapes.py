@@ -27,7 +27,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-
 FIXTURE_DIR = Path(__file__).parent / "gemma4_audio_golden"
 
 
@@ -43,7 +42,7 @@ EXPECTED = {
     },
     "sscp_out.npz": {
         "0": (1, 250, 1024),  # subsampled hidden
-        "1": (1, 250),        # subsampled mask
+        "1": (1, 250),  # subsampled mask
     },
     "audio_block_0_out.npz": {"data": (1, 250, 1024)},
     "audio_block_1_out.npz": {"data": (1, 250, 1024)},
@@ -59,8 +58,7 @@ EXPECTED = {
 def _require_fixtures() -> None:
     if not FIXTURE_DIR.exists() or not any(FIXTURE_DIR.glob("*.npz")):
         pytest.skip(
-            "Gemma 4 audio golden fixtures missing; run "
-            "tests/fixtures/capture_gemma4_audio_golden.py to produce them.",
+            "Gemma 4 audio golden fixtures missing; run tests/fixtures/capture_gemma4_audio_golden.py to produce them.",
             allow_module_level=False,
         )
 
@@ -74,9 +72,7 @@ def test_fixture_shapes(filename: str, fields: dict[str, tuple[int, ...]]) -> No
         for key, shape in fields.items():
             assert key in z.files, f"{filename} missing key {key!r}; has {z.files}"
             arr = z[key]
-            assert arr.shape == shape, (
-                f"{filename}:{key} shape {arr.shape} != expected {shape}"
-            )
+            assert arr.shape == shape, f"{filename}:{key} shape {arr.shape} != expected {shape}"
             assert not np.isnan(arr).any(), f"{filename}:{key} contains NaN"
             assert np.isfinite(arr).all(), f"{filename}:{key} contains inf"
 
@@ -87,8 +83,7 @@ def test_meta_json_records_versions_and_hashes() -> None:
     assert meta_path.exists(), "meta.json missing — capture script did not finish"
     meta = json.loads(meta_path.read_text())
 
-    for required in ("model_id", "transformers_version", "torch_version",
-                     "seed", "audio_config", "fixtures"):
+    for required in ("model_id", "transformers_version", "torch_version", "seed", "audio_config", "fixtures"):
         assert required in meta, f"meta.json missing {required!r}"
 
     # Every captured .npz must have a sha256 recorded; any silent

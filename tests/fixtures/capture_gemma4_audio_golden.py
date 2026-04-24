@@ -48,7 +48,6 @@ from pathlib import Path
 
 import numpy as np
 
-
 # ------------------------------------------------------------------ determinism
 
 
@@ -59,7 +58,10 @@ def _seed_everything(seed: int) -> None:
     import torch  # local import so the file parses on hosts without torch
 
     random.seed(seed)
-    np.random.seed(seed)
+    # Use the legacy global seeder on purpose — some HF code paths still hit
+    # ``np.random.rand`` / ``np.random.randn``, and those only respect the
+    # legacy global state, not a local ``np.random.Generator``.
+    np.random.seed(seed)  # noqa: NPY002
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
@@ -116,8 +118,9 @@ def _flatten_to_arrays(payload, prefix: str = "") -> dict[str, "np.ndarray"]:
     (bf16 isn't losslessly numpy-representable) into the fixtures; the JAX
     side casts on load per the tolerance contract.
     """
+    from dataclasses import asdict, is_dataclass
+
     import torch
-    from dataclasses import is_dataclass, asdict
 
     def _key(k):
         return f"{prefix}.{k}" if prefix else str(k)
@@ -192,9 +195,7 @@ def capture(
     )
     if input_features_mask is None:
         # Fall back: all-ones mask shaped like the time axis.
-        input_features_mask = torch.ones(
-            input_features.shape[0], input_features.shape[-1], dtype=torch.bool
-        )
+        input_features_mask = torch.ones(input_features.shape[0], input_features.shape[-1], dtype=torch.bool)
 
     np.savez(
         out_dir / "inputs.npz",
@@ -215,9 +216,7 @@ def capture(
     if audio_only:
         # Partial load: only the audio tower + projector weights. Keeps
         # memory footprint at ~600 MB in bf16 so this runs on a MacBook.
-        audio_tower, embed_audio, full_config = _load_audio_only(
-            model_id, torch_dtype=torch_dtype
-        )
+        audio_tower, embed_audio, full_config = _load_audio_only(model_id, torch_dtype=torch_dtype)
     else:
         model = transformers.AutoModelForImageTextToText.from_pretrained(
             model_id,
@@ -233,8 +232,7 @@ def capture(
 
     if audio_tower is None:
         raise RuntimeError(
-            f"{model_id} has no audio_tower; check that you picked the E4B "
-            f"variant (only E2B/E4B ship audio)."
+            f"{model_id} has no audio_tower; check that you picked the E4B variant (only E2B/E4B ship audio)."
         )
 
     audio_tower.eval()
@@ -252,11 +250,7 @@ def capture(
     handles = []
     # SSCP stem
     try:
-        handles.append(
-            audio_tower.subsample_conv_projection.register_forward_hook(
-                _hook("sscp_out")
-            )
-        )
+        handles.append(audio_tower.subsample_conv_projection.register_forward_hook(_hook("sscp_out")))
     except AttributeError:
         # HF may name it .conv_subsample / .stem depending on refactor; try
         # alternatives and record which one fired.
@@ -309,10 +303,13 @@ def capture(
     for name, val in captured.items():
         _save(name, val)
 
-    _save("audio_tower_out", {
-        "last_hidden_state": last_hidden_state,
-        "attention_mask": getattr(audio_out, "attention_mask", None),
-    })
+    _save(
+        "audio_tower_out",
+        {
+            "last_hidden_state": last_hidden_state,
+            "attention_mask": getattr(audio_out, "attention_mask", None),
+        },
+    )
     _save("projector_out", projected)
 
     # ---- meta -----------------------------------------------------------
@@ -379,7 +376,6 @@ def _load_audio_only(model_id: str, torch_dtype):
     ``transformers``' config to instantiate the sub-modules, then hydrates
     them from the checkpoint via prefix matching.
     """
-    import torch
     import transformers
     from safetensors import safe_open
 
@@ -416,9 +412,9 @@ def _load_audio_only(model_id: str, torch_dtype):
         with safe_open(shard, framework="pt") as f:
             for k in f.keys():
                 if k.startswith(want_tower):
-                    tower_sd[k[len(want_tower):]] = f.get_tensor(k).to(torch_dtype)
+                    tower_sd[k[len(want_tower) :]] = f.get_tensor(k).to(torch_dtype)
                 elif k.startswith(want_embed):
-                    embed_sd[k[len(want_embed):]] = f.get_tensor(k).to(torch_dtype)
+                    embed_sd[k[len(want_embed) :]] = f.get_tensor(k).to(torch_dtype)
     audio_tower.load_state_dict(tower_sd, strict=True)
     embed_audio.load_state_dict(embed_sd, strict=True)
 
