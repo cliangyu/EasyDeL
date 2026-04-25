@@ -1339,9 +1339,11 @@ class Gemma4Attention(UnifiedAttention):
         )
 
         # Capture post-norm, post-RoPE K/V for potential downstream sharing.
-        # Stored temporarily on the object to be harvested by the model loop.
-        # Using object.__setattr__ to bypass NNX pytree validation.
-        object.__setattr__(self, "_captured_kv", (key_states, value_states))
+        # Threaded through AttentionLayerOutput.captured_kv (return value) so
+        # JAX tracing, grad, and remat see the dependency. Previous revisions
+        # used object.__setattr__(self, "_captured_kv", ...) which bypassed
+        # NNX pytree validation and did not flow through the function graph.
+        captured_kv: tuple[Array, Array] = (key_states, value_states)
 
         causal_for_kernel = self.causal
         if mask_info is not None and getattr(mask_info, "_causal_baked", False):
@@ -1402,6 +1404,7 @@ class Gemma4Attention(UnifiedAttention):
             attention_output=attn_output,
             attention_weight=attentions.attention_weight if output_attentions else None,
             cache_view=cache_view,
+            captured_kv=captured_kv,
         )
 
     def __call__(
@@ -2184,6 +2187,7 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_weight=attn_outputs.attention_weight,
             cache_view=attn_outputs.cache_view,
+            captured_kv=attn_outputs.captured_kv,
         )
 
 
@@ -2600,11 +2604,11 @@ class Gemma4TextModel(EasyDeLBaseModule):
             )
             hidden_states = layer_outputs.hidden_states
 
-            # Store captured K/V for potential downstream sharing.
-            captured = getattr(attn, "_captured_kv", None)
-            if captured is not None and not attn.is_kv_shared_layer:
-                shared_kv[idx] = captured
-                object.__setattr__(attn, "_captured_kv", None)
+            # Store captured K/V for potential downstream sharing. Pulled from
+            # the layer's return value so the dependency flows through JAX's
+            # function graph (jit/grad/remat compose correctly).
+            if layer_outputs.captured_kv is not None and not attn.is_kv_shared_layer:
+                shared_kv[idx] = layer_outputs.captured_kv
                 # Track the donor's (potentially updated) cache view.
                 donor_cache_views[idx] = layer_outputs.cache_view
 

@@ -458,6 +458,12 @@ class AttentionLayerOutput(ModelOutput):
             Only returned when output_attentions=True.
         cache_view: Optional cache view for efficient autoregressive generation.
             Contains cached key-value pairs from previous steps.
+        captured_kv: Optional ``(key_states, value_states)`` tuple of post-norm,
+            post-RoPE K/V tensors. Used by models with KV-sharing across decoder
+            layers (e.g., Gemma 4) so a downstream layer can reuse the donor's
+            K/V without recomputing projections. Threaded through the function
+            output graph rather than via module side-channels so JAX tracing,
+            grad, and remat compose correctly.
 
     Example:
         >>> attn_output = AttentionLayerOutput(
@@ -471,6 +477,7 @@ class AttentionLayerOutput(ModelOutput):
     attention_output: Array
     attention_weight: Array | None = None
     cache_view: TransformerCacheView | None = None
+    captured_kv: tuple[Array, Array] | None = None
 
 
 @auto_pytree
@@ -547,6 +554,7 @@ class DecoderLayerOutput(ModelOutput):
     router_logits: Array | None = None
     gate_loss: Array | None = None
     cache_view: TransformerCacheView | None = None
+    captured_kv: tuple[Array, Array] | None = None
 
 
 @auto_pytree
