@@ -553,11 +553,7 @@ def grpo_step(
                         coef_1 = jnp.minimum(coef_1, delta)
                     per_token_loss1 = coef_1 * chunk_advantages
                     per_token_loss2 = coef_2 * chunk_advantages
-                    chunk_per_token_loss = -jnp.where(
-                        chunk_advantages >= 0,
-                        jnp.minimum(per_token_loss1, per_token_loss2),
-                        jnp.maximum(per_token_loss1, per_token_loss2),
-                    )
+                    chunk_per_token_loss = -jnp.minimum(per_token_loss1, per_token_loss2)
                 else:
                     raise ValueError(f"Unknown loss type: {loss_type}")
 
@@ -710,12 +706,7 @@ def grpo_step(
 
             per_token_loss1 = coef_1 * advantages
             per_token_loss2 = coef_2 * advantages
-            # Use min for A >= 0, max for A < 0 (pessimistic bound)
-            per_token_loss = -jnp.where(
-                advantages >= 0,
-                jnp.minimum(per_token_loss1, per_token_loss2),
-                jnp.maximum(per_token_loss1, per_token_loss2),
-            )
+            per_token_loss = -jnp.minimum(per_token_loss1, per_token_loss2)
         else:
             raise ValueError(f"Unknown loss type: {loss_type}")
 
