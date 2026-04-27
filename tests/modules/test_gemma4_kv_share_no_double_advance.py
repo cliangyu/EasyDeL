@@ -23,7 +23,6 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from flax import nnx as nn
 from jax.sharding import Mesh
 
