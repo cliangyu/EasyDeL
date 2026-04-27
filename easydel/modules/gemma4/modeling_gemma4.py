@@ -3423,34 +3423,53 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             **kwargs,
         )
 
+    def get_embedding(self):
+        """Return the language model's token embedding layer.
+
+        The VLM-tied logit path needs the same Embed instance used by the
+        text path so .attend() reads the tied vocabulary table.
+        """
+        return self.base_model.get_embedding()
+
     def apply_lm_head(self, hidden_states: Array) -> Array:
         """Project hidden states to vocabulary logits with optional soft-capping.
 
-        Args:
-            hidden_states: Final hidden representations
-                ``[batch, seq_len, hidden_size]``.
-
-        Returns:
-            Vocabulary logits ``[batch, seq_len, vocab_size]``.
+        Mirrors the text-only path: when ``tie_word_embeddings`` is set, use
+        the input embedding's native ``attend`` so the tied LM head matches
+        the text-only model bit-for-bit (the generic ColumnParallelLinear
+        projection drifts under TPU tensor-parallel layouts).
         """
-        logits = super().apply_lm_head(hidden_states)
+        if getattr(self.config.text_config, "tie_word_embeddings", False):
+            lm_logits = self.get_embedding().attend(hidden_states)
+        else:
+            lm_logits = super().apply_lm_head(hidden_states)
         cap = getattr(self.config.text_config, "final_logit_softcapping", None)
         if cap is not None:
-            cap = jnp.array(cap, dtype=logits.dtype)
-            logits = cap * jax.nn.tanh(logits / cap)
-        return logits
+            cap = jnp.array(cap, dtype=lm_logits.dtype)
+            lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+        return lm_logits
 
     def make_lm_head_fn(self):
-        """Trace-safe projection with Gemma-4 VLM soft-capping."""
-        base_fn = super().make_lm_head_fn()
+        """Trace-safe projection mirroring the text path's tied-attend."""
         cap_value = getattr(self.config.text_config, "final_logit_softcapping", None)
-        if cap_value is None:
-            return base_fn
+        if getattr(self.config.text_config, "tie_word_embeddings", False):
+            _attend = self.get_embedding().attend
 
-        def _project(hidden_states):
-            logits = base_fn(hidden_states)
-            cap = jnp.array(cap_value, dtype=logits.dtype)
-            return cap * jax.nn.tanh(logits / cap)
+            def _project(hidden_states):
+                lm_logits = _attend(hidden_states)
+                if cap_value is not None:
+                    cap = jnp.array(cap_value, dtype=lm_logits.dtype)
+                    lm_logits = cap * jax.nn.tanh(lm_logits / cap)
+                return lm_logits
+        else:
+            base_fn = super().make_lm_head_fn()
+            if cap_value is None:
+                return base_fn
+
+            def _project(hidden_states):
+                logits = base_fn(hidden_states)
+                cap = jnp.array(cap_value, dtype=logits.dtype)
+                return cap * jax.nn.tanh(logits / cap)
 
         return _project
 
