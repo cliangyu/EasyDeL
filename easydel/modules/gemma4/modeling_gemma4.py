@@ -72,6 +72,7 @@ from eformer.escale import apply_logical_sharding
 from ejkernel.types import MaskInfo
 from flax import nnx as nn
 from jax.ad_checkpoint import checkpoint_name
+from jax.experimental import checkify
 from jaxtyping import Array, Bool, Float, Int
 
 from easydel.caching import (
@@ -3106,14 +3107,12 @@ class Gemma4Model(EasyDeLBaseModule):
                 input_features_mask=input_features_mask,
             )
             audio_features = audio_features.astype(inputs_embeds.dtype)
-            # Zero out padded post-SSCP frames so the gather skips them and
-            # placeholder #k always pulls the k-th *valid* feature.
-            audio_features = audio_features * audio_output_mask[..., None].astype(audio_features.dtype)
 
-            inputs_embeds = self._scatter_features_at_token(
+            inputs_embeds = self._scatter_audio_features_at_token(
                 inputs_embeds=inputs_embeds,
                 input_ids=input_ids,
                 features=audio_features,
+                valid_mask=audio_output_mask,
                 token_id=self.config.audio_token_id,
             )
 
@@ -3160,6 +3159,72 @@ class Gemma4Model(EasyDeLBaseModule):
             special_mask[:, :, None],
             features_at_pos.reshape(inputs_embeds.shape),
             inputs_embeds,
+        )
+
+    @staticmethod
+    def _scatter_audio_features_at_token(
+        inputs_embeds: Array,
+        input_ids: Array,
+        features: Array,
+        valid_mask: Array,
+        token_id: int,
+    ) -> Array:
+        """Per-row audio scatter — variable valid length, no cross-row leakage.
+
+        Audio differs from image in two ways: (1) different rows may have
+        different numbers of *valid* post-SSCP frames, and (2) ``features``
+        is right-padded with zeros for invalid frames. The image scatter
+        ``_scatter_features_at_token`` flattens across batch and does a
+        single cumsum, which leaks the k-th valid feature from row 0 into
+        a placeholder slot in row 1 whenever row 0 has fewer placeholders
+        than valid features (or vice versa).
+
+        This implementation isolates each row via ``vmap``:
+
+        1. Stable argsort on ``-valid_mask`` compacts valid features to
+           the front of the ``T`` axis so position k holds the k-th
+           valid feature for that row.
+        2. Per-row placeholder-position cumsum decides which compacted
+           feature each placeholder pulls.
+        3. ``checkify.check`` injects a runtime assertion that the per-row
+           placeholder count equals the per-row valid count — the v3
+           Python ``assert`` only fired at trace time.
+
+        Args:
+            inputs_embeds: ``(B, L, D)`` token embedding stream.
+            input_ids: ``(B, L)`` token ids — only the comparison with
+                ``token_id`` is used.
+            features: ``(B, T, D)`` post-SSCP audio features (right-padded).
+            valid_mask: ``(B, T)`` bool — True = valid post-SSCP frame.
+            token_id: Audio placeholder integer id.
+        """
+        T = features.shape[1]
+
+        def _scatter_one_row(input_ids_b, inputs_embeds_b, features_b, valid_mask_b):
+            valid_int = valid_mask_b.astype(jnp.int32)
+            sort_idx = jnp.argsort(-valid_int, stable=True)
+            packed_features = features_b[sort_idx]
+
+            placeholder_mask = input_ids_b == token_id
+            n_placeholders = placeholder_mask.sum()
+            n_valid = valid_int.sum()
+            checkify.check(
+                n_placeholders == n_valid,
+                "Per-row audio placeholder count must equal per-row valid feature count.",
+            )
+
+            row_cumsum = jnp.cumsum(placeholder_mask.astype(jnp.int32)) - 1
+            gather_idx = jnp.where(placeholder_mask, jnp.minimum(row_cumsum, T - 1), 0)
+            gathered = packed_features[gather_idx]
+            return jnp.where(placeholder_mask[:, None], gathered, inputs_embeds_b)
+
+        # ``checkify.check`` is a no-op unless this helper is wrapped by
+        # ``checkify.checkify`` at the call boundary. Wrapping inside this
+        # helper would force an extra (err, value) return type that breaks
+        # jit composition, so callers that want runtime enforcement
+        # should checkify-wrap the outer model __call__ instead.
+        return jax.vmap(_scatter_one_row)(
+            input_ids, inputs_embeds, features, valid_mask
         )
 
     def _compute_per_layer_inputs(self, input_ids: Array | None) -> Array | None:
