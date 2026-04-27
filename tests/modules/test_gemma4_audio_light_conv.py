@@ -118,7 +118,10 @@ def test_depthwise_groups_param_shape() -> None:
     ``(kernel_size, in/groups, out)`` so depthwise has ``in/groups = 1``.
     """
     layer = _make_causal_conv(kernel_size=5, channels=16, groups=16)
-    kernel_shape = layer.conv.kernel.value.shape
+    # Gemma4AudioCausalConv1d now subclasses nn.Conv directly (the wrapper
+    # `.conv` was removed so HF's `depthwise_conv1d.weight` lands on the
+    # right Flax param path during state-dict load).
+    kernel_shape = layer.kernel.value.shape
     assert kernel_shape == (5, 1, 16), f"expected (5, 1, 16), got {kernel_shape}"
 
 
@@ -159,7 +162,7 @@ def test_light_conv_has_depthwise_conv() -> None:
     _, block = _make_light_conv(hidden_size=64)
     assert isinstance(block.depthwise_conv1d, Gemma4AudioCausalConv1d)
     # Groups == hidden_size implies kernel shape (K, 1, hidden_size).
-    kernel_shape = block.depthwise_conv1d.conv.kernel.value.shape
+    kernel_shape = block.depthwise_conv1d.kernel.value.shape
     assert kernel_shape == (5, 1, 64), f"expected (5, 1, 64), got {kernel_shape}"
 
 

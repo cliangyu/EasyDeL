@@ -280,6 +280,56 @@ class ConvertArgs:
         default=False,
         metadata={"help": "Enable hf_transfer accelerated HF downloads (requires `pip install hf_transfer`)"},
     )
+    verify: bool = field(
+        default=False,
+        metadata={
+            "help": "After save, reload the checkpoint via from_pretrained and walk every parameter leaf to catch "
+            "silent breakage (raw nnx.Variable on load, missing kernel slots, NaN/Inf). Exits non-zero on failure."
+        },
+    )
+
+
+def _verify_roundtrip(out_dir, model_cls, dtype, param_dtype, sharding_axis_dims, sharding_axis_names) -> None:
+    """Reload the saved checkpoint and assert every parameter leaf is finite.
+
+    This is the minimum-viable gate against the two silent-corruption modes that
+    have bitten this converter: (a) raw ``nnx.Variable`` calibration buffers
+    that raise ``TypeError`` from ``recreate_meta_values`` on load, and
+    (b) HF→EasyDeL name-mapping gaps that leave random-init weights at the
+    target paths. Case (a) is caught by the load itself raising; case (b) is
+    caught only weakly here (random init is still finite) — for a true value
+    diff against source, run ``parity_easydel_vs_hf_golden.py`` separately.
+    """
+    from flax import nnx as nn
+    from flax.nnx import traversals as fnx_traversals
+    import jax.numpy as jnp
+
+    logger.info(f"--verify: reloading checkpoint from {out_dir}")
+    model = model_cls.from_pretrained(
+        str(out_dir),
+        dtype=dtype,
+        param_dtype=param_dtype,
+        sharding_axis_dims=sharding_axis_dims,
+        sharding_axis_names=sharding_axis_names,
+        auto_shard_model=False,
+    )
+    state = nn.state(model)
+    flat = fnx_traversals.flatten_mapping(state)
+    leaves = [(k, v) for k, v in flat.items() if hasattr(v, "value") and hasattr(v.value, "shape")]
+    if not leaves:
+        raise SystemExit(f"--verify: reloaded model has zero array leaves at {out_dir}")
+    bad = []
+    for path, var in leaves:
+        arr = jnp.asarray(var.value)
+        if arr.size == 0:
+            continue
+        if not bool(jnp.all(jnp.isfinite(arr))):
+            bad.append((".".join(str(p) for p in path), tuple(arr.shape), "non-finite"))
+    if bad:
+        for path, shape, reason in bad[:10]:
+            logger.error(f"--verify FAIL  {path}  shape={shape}  reason={reason}")
+        raise SystemExit(f"--verify: {len(bad)} leaves failed finiteness check")
+    logger.info(f"--verify OK: reloaded {len(leaves)} parameter leaves, all finite")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -439,6 +489,16 @@ def main(argv: list[str] | None = None) -> None:
     logger.info(f"Done. Saved to: {out_dir}")
     if args.repo_id and args.push_to_hub:
         logger.info(f"Pushed to: {args.repo_id}")
+
+    if args.verify:
+        _verify_roundtrip(
+            out_dir=out_dir,
+            model_cls=model_cls,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            sharding_axis_dims=sharding_axis_dims,
+            sharding_axis_names=sharding_axis_names,
+        )
 
 
 if __name__ == "__main__":

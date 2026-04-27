@@ -108,16 +108,12 @@ class Gemma4AudioRelPositionalEncoding(nn.Module):
     def __init__(self, config: Gemma4AudioConfig, dtype: jnp.dtype = jnp.bfloat16):
         self.hidden_size = config.hidden_size
         self.dtype = dtype
-
-        min_timescale = 1.0
-        max_timescale = 10_000.0
-        num_timescales = self.hidden_size // 2
-        log_timescale_increment = math.log(max_timescale / min_timescale) / max(num_timescales - 1, 1)
-        # Shape: (1, 1, num_timescales) — matches HF's double-unsqueeze so the
-        # runtime broadcast produces (1, 13, num_timescales).
-        self.inv_timescales = (
-            min_timescale * jnp.exp(jnp.arange(num_timescales, dtype=jnp.float32) * -log_timescale_increment)
-        )[None, None, :]
+        # Cache scalar constants — recompute the array in __call__ so the
+        # value materializes as a real jax.Array each forward, surviving the
+        # easydel lazy-init `eval_shape` pass that turns plain __init__
+        # jnp arrays into bare ShapeDtypeStructs.
+        self._min_timescale = 1.0
+        self._max_timescale = 10_000.0
 
     def __call__(self, hidden_states: Float[Array, "batch seq hidden"]) -> Float[Array, "1 13 hidden"]:
         """Return the positional bias tensor that attention blocks mix into logits.
@@ -127,10 +123,15 @@ class Gemma4AudioRelPositionalEncoding(nn.Module):
         accepted for API parity with HF, which reads ``device`` and ``dtype``
         off the input tensor.
         """
+        num_timescales = self.hidden_size // 2
+        log_timescale_increment = math.log(self._max_timescale / self._min_timescale) / max(num_timescales - 1, 1)
+        inv_timescales = (
+            self._min_timescale * jnp.exp(jnp.arange(num_timescales, dtype=jnp.float32) * -log_timescale_increment)
+        )[None, None, :]
         # position_ids: shape (13, 1) — literal 12..0 per HF.
         position_ids = jnp.arange(12, -1, -1, dtype=jnp.float32)[:, None]
         # scaled_time broadcasts (13, 1) * (1, 1, num_timescales) -> (1, 13, num_timescales).
-        scaled_time = position_ids * self.inv_timescales
+        scaled_time = position_ids * inv_timescales
         # Final shape (1, 13, hidden_size) with concatenated sin/cos halves.
         pos_embed = jnp.concatenate([jnp.sin(scaled_time), jnp.cos(scaled_time)], axis=-1)
         return pos_embed.astype(hidden_states.dtype)
@@ -331,14 +332,18 @@ class Gemma4AudioFeedForward(nn.Module):
         return hidden_states
 
 
-class Gemma4AudioCausalConv1d(nn.Module):
+class Gemma4AudioCausalConv1d(nn.Conv):
     """Left-padded 1-D convolution — the causal variant used in light-conv blocks.
 
     Direct port of HF's ``Gemma4AudioCausalConv1d``, which subclasses
     ``nn.Conv1d`` and overrides ``forward`` to left-pad the input sequence
-    before invoking the parent convolution. The HF version derives
-    ``left_pad`` from the dilated kernel size minus the stride so the
-    computation works for non-default strides/dilations too:
+    before invoking the parent convolution. We mirror the inheritance to
+    keep the Flax NNX param path identical to HF's: ``depthwise_conv1d.kernel``
+    rather than the wrapped ``depthwise_conv1d.conv.kernel``. This matters for
+    the HF→EasyDeL state-dict bridge, which produces leaf paths from HF
+    keys directly. The HF version derives ``left_pad`` from the dilated
+    kernel size minus the stride so the computation works for non-default
+    strides/dilations too:
 
     .. code-block:: python
 
@@ -379,20 +384,15 @@ class Gemma4AudioCausalConv1d(nn.Module):
         precision: jax.lax.PrecisionLike = None,
         rngs: nn.Rngs,
     ):
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.dilation = dilation
-        # Matches HF's ``left_pad`` cached property.
         self.left_pad = (kernel_size - 1) * dilation + 1 - stride
-
-        self.conv = nn.Conv(
+        super().__init__(
             in_features=in_channels,
             out_features=out_channels,
             kernel_size=(kernel_size,),
             strides=(stride,),
             kernel_dilation=(dilation,),
             feature_group_count=groups,
-            padding="VALID",  # Manual left-pad handles causality.
+            padding="VALID",
             use_bias=use_bias,
             dtype=dtype,
             param_dtype=param_dtype,
@@ -401,9 +401,8 @@ class Gemma4AudioCausalConv1d(nn.Module):
         )
 
     def __call__(self, x: Float[Array, "batch length channels"]) -> Array:
-        # Left-pad the length axis; leave batch and channel axes untouched.
         x = jnp.pad(x, ((0, 0), (self.left_pad, 0), (0, 0)))
-        return self.conv(x)
+        return super().__call__(x)
 
 
 class Gemma4AudioLightConv1d(nn.Module):

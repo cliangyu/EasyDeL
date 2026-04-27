@@ -497,6 +497,11 @@ def recreate_meta_values(values: dict[str, tp.Any], seed: int | None = None) -> 
                 values[key].value = recreator.get_count()
             elif isinstance(type(value), nnx.RngKey | type) and issubclass(type(value), nnx.RngKey):
                 values[key].value = recreator.get_rng()
+            elif isinstance(value, nnx.Variable):
+                # Plain nnx.Variable (e.g. ClippableLinear input_min/max calibration buffers).
+                # Leave .value alone — it was either set from the source tree in
+                # merge_state_and_tree or is still the module __init__ default.
+                continue
             else:
                 raise TypeError(f"Unexpected type {type(value)} for key {key}")
     except Exception as e:
@@ -558,6 +563,10 @@ def merge_state_and_tree(tree: dict, state: nnx.State, *, silence: bool = False)
     lost_data = False
     if not is_flatten(params):
         params = flatten_dict(params)
+    if not is_flatten(others):
+        others_flat = flatten_dict(others)
+    else:
+        others_flat = others
     if not is_flatten(tree):
         tree = flatten_dict(tree)
     tree = string_key_to_int(tree)
@@ -572,10 +581,22 @@ def merge_state_and_tree(tree: dict, state: nnx.State, *, silence: bool = False)
                 lost_data = True
             # Avoid type '<class 'jax._src.api.ShapeDtypeStruct'>' is not a valid JAX type
             params[keys].value = None
+    # Flow tree values into the non-Param "others" bucket too — calibration
+    # variables (input_min/max/output_min/max on ClippableLinear) live here as
+    # plain nnx.Variable and would otherwise be left at their pos_inf init.
+    for keys in list(others_flat.keys()):
+        leaf = others_flat[keys]
+        if not isinstance(leaf, nnx.Variable):
+            continue
+        if isinstance(leaf, (nnx.RngCount, nnx.RngKey)):
+            continue
+        tree_values = tree.get(keys, None)
+        if tree_values is not None:
+            leaf.value = tree_values
     if lost_data:
         logger.debug(f"tree-array strc keys {tree.keys()}")
-    others = recreate_meta_values(others)
-    state = refine_graphs(others, params)
+    others_flat = recreate_meta_values(others_flat)
+    state = refine_graphs(others_flat, params)
     return state
 
 
