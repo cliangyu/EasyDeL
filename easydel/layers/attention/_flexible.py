@@ -73,6 +73,7 @@ from easydel.caching import (
     TransformerMetadata,
     UnifiedAttentionCacheView,
 )
+from easydel.caching.transformer.cache import _maybe_materialize as _maybe_materialize_kv
 from easydel.infra.base_config import EasyDeLBaseConfig
 from easydel.infra.utils import AttnMaskDetail, AttnMaskType
 from easydel.operations import AttentionOutput, OperationMetadata, OperationRegistry, ScaledDotProductAttn
@@ -1098,6 +1099,7 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         cache_view: TransformerCacheView | RaggedPagesCacheView | UnifiedAttentionCacheView | None = None,
         cache_metadata: TransformerMetadata | RaggedPagesMetadata | OperationsMetadata | None = None,
         sliding_window: int | None = None,
+        write_cache: bool = True,
     ) -> tuple[
         Array,
         Array,
@@ -1162,7 +1164,8 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
         if not is_ragged_cache and isinstance(cache_view, ParallelHybridCacheView):
             is_ragged_cache = cache_view.is_ragged
         if is_ragged_cache:
-            cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
+            if write_cache:
+                cache_view = cache_view.concatenate_to_cache(key=key, value=value, cache_metadata=cache_metadata)
 
             batch_size: int = query.shape[0]
             dtype_for_bias: jnp.dtype = self.dtype
@@ -1188,15 +1191,29 @@ class AttentionModule(nn.Module, tp.Generic[Cfg]):
             batches_match: bool = query_batch == cache_batch
             assert batches_match, "Batch size mismatch between query and cache."
 
-        key, value, mask_info, cache_view, _masking_details = self._handle_cache_concat(
-            query=query,
-            key=key,
-            value=value,
-            mode=mode_computed,
-            mask_info=mask_info,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-        )
+        if write_cache:
+            key, value, mask_info, cache_view, _masking_details = self._handle_cache_concat(
+                query=query,
+                key=key,
+                value=value,
+                mode=mode_computed,
+                mask_info=mask_info,
+                cache_view=cache_view,
+                cache_metadata=cache_metadata,
+            )
+        else:
+            # Read-only path: shared decoder layers must NOT advance the donor's
+            # cache.indexs. Read full preallocated buffer and apply mask using the
+            # donor's already-advanced indexs (donor wrote first, so cache_view.indexs
+            # already reflects the current step's contribution).
+            assert cache_view is not None, "write_cache=False requires a cache_view"
+            key = _maybe_materialize_kv(cache_view.key).astype(query.dtype)
+            value = _maybe_materialize_kv(cache_view.value).astype(query.dtype)
+            mask_info = mask_info.apply_kv_lengths(
+                kv_lengths=cache_view.indexs,
+                q_len=query.shape[1],
+                end_index=cache_view.indexs,
+            )
 
         metadata_is_none: bool = cache_metadata is None
         cache_view_exists: bool = cache_view is not None

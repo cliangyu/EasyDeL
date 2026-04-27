@@ -1495,11 +1495,12 @@ class Gemma4Attention(UnifiedAttention):
             sliding_window_for_kernel = None
 
         # Shared layers read from the donor's cache view (which is aliased
-        # to this layer's view).  The donor already wrote K/V for the current
-        # tokens, so we call concatenate for cache reads (mask setup, bias
-        # init) but the write is effectively a no-op since the pages already
-        # contain the correct data.  For the eager (no-cache) path the shared
-        # K/V are used directly without any cache interaction.
+        # to this layer's view). The donor already wrote K/V for the current
+        # tokens and advanced cache_view.indexs, so we MUST NOT write again
+        # (would double-advance indexs and corrupt the cache page). Pass
+        # write_cache=False to take the read-only branch in concatenate which
+        # reads K/V from the preallocated buffer and applies mask_info via
+        # cache_view.indexs without re-advancing.
         init_attention_bias = None
         if cache_view is not None:
             (
@@ -1517,6 +1518,7 @@ class Gemma4Attention(UnifiedAttention):
                 cache_metadata=cache_metadata,
                 mask_info=mask_info,
                 sliding_window=sliding_window_for_kernel,
+                write_cache=False,
             )
             if mask_info is not None and getattr(mask_info, "sliding_window_baked_in", False):
                 sliding_window_for_kernel = None
