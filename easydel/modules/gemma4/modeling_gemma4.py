@@ -130,8 +130,17 @@ def _has_registered_gemma4_vision_backend(config: Gemma4VisionConfig | None) -> 
         return False
 
 
-def _gemma4_vision_pixel_values_to_nhwc(pixel_values: Array) -> Array:
+def _gemma4_vision_pixel_values_to_nhwc(pixel_values: Array, *, is_video: bool = False) -> Array:
     """Convert image inputs to NHWC, accepting both NCHW and NHWC layouts."""
+    if pixel_values.ndim == 5:
+        if not is_video:
+            raise ValueError("Gemma4 image vision inputs must be rank-4 tensors.")
+        if pixel_values.shape[-1] in (1, 3, 4):
+            return pixel_values
+        if pixel_values.shape[2] in (1, 3, 4):
+            return jnp.transpose(pixel_values, (0, 1, 3, 4, 2))
+        return pixel_values
+
     if pixel_values.ndim != 4:
         raise ValueError("Gemma4 vision inputs must be rank-4 tensors.")
 
@@ -241,9 +250,13 @@ class Gemma4RMSNorm(nn.Module):
         return out.astype(target_dtype)
 
 
-def _gemma4_vision_patchify(pixel_values: Array, patch_size: int) -> tuple[Array, Array]:
+def _gemma4_vision_patchify(pixel_values: Array, patch_size: int, *, is_video: bool = False) -> tuple[Array, Array]:
     """Convert raw images into flat patches and 2-D patch position ids."""
-    pixel_values = _gemma4_vision_pixel_values_to_nhwc(pixel_values)
+    pixel_values = _gemma4_vision_pixel_values_to_nhwc(pixel_values, is_video=is_video)
+    if pixel_values.ndim == 5:
+        batch_size, num_frames, height, width, channels = pixel_values.shape
+        pixel_values = pixel_values.reshape(batch_size * num_frames, height, width, channels)
+
     batch_size, height, width, channels = pixel_values.shape
     if height % patch_size != 0 or width % patch_size != 0:
         raise ValueError(
@@ -277,8 +290,48 @@ def _gemma4_vision_prepare_inputs(
     pixel_values: Array,
     patch_size: int,
     pixel_position_ids: Array | None = None,
+    *,
+    is_video: bool = False,
 ) -> tuple[Array, Array, Array]:
     """Normalize Gemma4 vision inputs to flat patches plus patch positions."""
+    if is_video and pixel_values.ndim == 5:
+        patches, inferred_position_ids = _gemma4_vision_patchify(pixel_values, patch_size, is_video=True)
+        if pixel_position_ids is None:
+            pixel_position_ids = inferred_position_ids
+            padding_positions = jnp.zeros(patches.shape[:2], dtype=jnp.bool_)
+        else:
+            pixel_position_ids = pixel_position_ids.reshape(-1, *pixel_position_ids.shape[2:]).astype(jnp.int32)
+            padding_positions = jnp.all(pixel_position_ids == -1, axis=-1)
+        return patches, pixel_position_ids, padding_positions
+
+    if is_video and pixel_values.ndim == 4:
+        num_videos, num_frames, max_patches, patch_dim = pixel_values.shape
+        patches = pixel_values.reshape(num_videos * num_frames, max_patches, patch_dim)
+        if pixel_position_ids is not None:
+            pixel_position_ids = pixel_position_ids.reshape(
+                num_videos * num_frames,
+                max_patches,
+                -1,
+            ).astype(jnp.int32)
+            padding_positions = jnp.all(pixel_position_ids == -1, axis=-1)
+            return patches, pixel_position_ids, padding_positions
+
+        num_patches = patches.shape[1]
+        grid_size = int(num_patches**0.5)
+        if grid_size * grid_size != num_patches:
+            raise ValueError(
+                "Flat video patch inputs require `video_position_ids` unless the patch count forms a perfect square."
+            )
+        grid_x, grid_y = jnp.meshgrid(
+            jnp.arange(grid_size, dtype=jnp.int32),
+            jnp.arange(grid_size, dtype=jnp.int32),
+            indexing="xy",
+        )
+        pixel_position_ids = jnp.stack((grid_x, grid_y), axis=-1).reshape(1, num_patches, 2)
+        pixel_position_ids = jnp.broadcast_to(pixel_position_ids, (patches.shape[0], num_patches, 2))
+        padding_positions = jnp.zeros(patches.shape[:2], dtype=jnp.bool_)
+        return patches, pixel_position_ids, padding_positions
+
     if pixel_values.ndim == 4:
         patches, inferred_position_ids = _gemma4_vision_patchify(pixel_values, patch_size)
         if pixel_position_ids is None:
@@ -945,6 +998,7 @@ class Gemma4VisionModel(EasyDeLBaseModule):
         pixel_values: Array,
         pixel_position_ids: Array | None = None,
         image_position_ids: Array | None = None,
+        is_video: bool = False,
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
     ) -> BaseModelOutput:
@@ -957,6 +1011,7 @@ class Gemma4VisionModel(EasyDeLBaseModule):
             pixel_values=pixel_values,
             patch_size=self.config.patch_size,
             pixel_position_ids=pixel_position_ids,
+            is_video=is_video,
         )
         output_length = patches.shape[-2] // max(int(self.config.pooling_kernel_size), 1) ** 2
         inputs_embeds = self.patch_embedder(
@@ -3042,21 +3097,58 @@ class Gemma4Model(EasyDeLBaseModule):
         audio_features = self.embed_audio(last_hidden_state)
         return audio_features, output_mask
 
+    def get_video_features(
+        self,
+        pixel_values_videos: Array,
+        video_position_ids: Array | None = None,
+    ) -> Array:
+        """Extract and project video frame features using the shared vision tower.
+
+        Gemma4 treats videos as frame batches on the model side: flatten
+        ``(num_videos, num_frames, ...)`` to image-like rows, run the existing
+        vision tower, then project into the text embedding space.
+        """
+        self._require_vision_tower()
+        if pixel_values_videos.ndim not in (4, 5):
+            raise ValueError(
+                "Gemma4 video inputs must be raw frames `[batch, frames, channels, height, width]` "
+                "or flat patches `[batch, frames, num_patches, patch_dim]`."
+            )
+
+        num_items = pixel_values_videos.shape[0] * pixel_values_videos.shape[1]
+        pixel_values_videos = pixel_values_videos.reshape(num_items, *pixel_values_videos.shape[2:])
+        if video_position_ids is not None:
+            video_position_ids = video_position_ids.reshape(
+                num_items,
+                *video_position_ids.shape[2:],
+            ).astype(jnp.int32)
+
+        vision_outputs = self.vision_tower(
+            pixel_values=pixel_values_videos,
+            pixel_position_ids=video_position_ids,
+        )
+        return self.embed_vision(vision_outputs.last_hidden_state)
+
     def compute_embedding(
         self,
         input_ids: Array,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        video_position_ids: Array | None = None,
         input_features: Array | None = None,
         input_features_mask: Array | None = None,
     ) -> Array:
         """Compute text embeddings and merge vision/audio features at placeholders.
 
         Token embeddings are looked up and scaled by ``sqrt(hidden_size)``.
-        Optional modalities are then merged in HF's order — image, audio:
+        Optional modalities are then merged in HF's order — image, video, audio:
 
         * ``pixel_values`` (when present): vision tower → ``embed_vision`` →
           scattered at ``input_ids == config.image_token_id`` positions.
+        * ``pixel_values_videos`` (when present): frames flattened through the
+          vision tower → ``embed_vision`` → scattered at
+          ``input_ids == config.video_token_id`` positions.
         * ``input_features`` (when present): audio tower → ``embed_audio`` →
           scattered at ``input_ids == config.audio_token_id`` positions.
 
@@ -3075,6 +3167,8 @@ class Gemma4Model(EasyDeLBaseModule):
             input_ids: Token IDs ``[batch, seq_len]``.
             pixel_values: Image pixel values for the vision encoder, or ``None``.
             image_position_ids: Optional 2-D image position ids.
+            pixel_values_videos: Video pixel values / patches, or ``None``.
+            video_position_ids: Optional 2-D video patch position ids.
             input_features: ``(B, T_mel, F_mel)`` log-mel spectrogram, or ``None``.
             input_features_mask: ``(B, T_mel)`` mel validity mask, or ``None``.
 
@@ -3101,6 +3195,20 @@ class Gemma4Model(EasyDeLBaseModule):
                 input_ids=input_ids,
                 features=image_features,
                 token_id=self.config.image_token_id,
+            )
+
+        if pixel_values_videos is not None:
+            video_features = self.get_video_features(
+                pixel_values_videos=pixel_values_videos,
+                video_position_ids=video_position_ids,
+            )
+            video_features = video_features.astype(inputs_embeds.dtype)
+
+            inputs_embeds = self._scatter_features_at_token(
+                inputs_embeds=inputs_embeds,
+                input_ids=input_ids,
+                features=video_features,
+                token_id=self.config.video_token_id,
             )
 
         if input_features is not None:
@@ -3247,6 +3355,8 @@ class Gemma4Model(EasyDeLBaseModule):
         input_ids: Array,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        video_position_ids: Array | None = None,
         input_features: Array | None = None,
         input_features_mask: Array | None = None,
         **_kwargs,
@@ -3256,6 +3366,8 @@ class Gemma4Model(EasyDeLBaseModule):
             input_ids,
             pixel_values,
             image_position_ids=image_position_ids,
+            pixel_values_videos=pixel_values_videos,
+            video_position_ids=video_position_ids,
             input_features=input_features,
             input_features_mask=input_features_mask,
         )
@@ -3269,6 +3381,8 @@ class Gemma4Model(EasyDeLBaseModule):
         input_ids: Array | None = None,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        video_position_ids: Array | None = None,
         input_features: Array | None = None,
         input_features_mask: Array | None = None,
         attention_mask: Array | None = None,
@@ -3294,6 +3408,8 @@ class Gemma4Model(EasyDeLBaseModule):
             input_ids: Token IDs ``[batch, seq_len]``.
             pixel_values: Image data for the vision encoder.
             image_position_ids: Optional 2-D image position ids.
+            pixel_values_videos: Video frame patches / pixels for the vision encoder.
+            video_position_ids: Optional 2-D video patch position ids.
             input_features: ``(B, T_mel, F_mel)`` audio log-mel features.
             input_features_mask: ``(B, T_mel)`` audio validity mask.
             attention_mask: Padding mask ``[batch, seq_len]``.
@@ -3316,6 +3432,8 @@ class Gemma4Model(EasyDeLBaseModule):
                 input_ids,
                 pixel_values,
                 image_position_ids=image_position_ids,
+                pixel_values_videos=pixel_values_videos,
+                video_position_ids=video_position_ids,
                 input_features=input_features,
                 input_features_mask=input_features_mask,
             )
@@ -3328,6 +3446,8 @@ class Gemma4Model(EasyDeLBaseModule):
             attention_mask=attention_mask,
             mask_info=mask_info,
             position_ids=position_ids,
+            # TODO(processor-rename): HF processors emit `mm_token_type_ids`; EasyDeL keeps
+            # the public `token_type_ids` kwarg until processor-side adapters are added.
             token_type_ids=token_type_ids,
             per_layer_inputs=per_layer_inputs,
             output_attentions=output_attentions,
@@ -3375,7 +3495,7 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         rngs: Random number generator state.
     """
 
-    _supports_video = False
+    _supports_video = True
     _uses_mrope = False
     _vision_tower_name = "vision_tower"
     _projector_name = "embed_vision"
@@ -3427,6 +3547,17 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         )
         return self.base_model.embed_vision(vision_outputs.last_hidden_state)
 
+    def get_video_features(
+        self,
+        pixel_values_videos: Array,
+        video_position_ids: Array | None = None,
+    ) -> Array:
+        """Extract and project video features from frame patches / pixels."""
+        return self.base_model.get_video_features(
+            pixel_values_videos=pixel_values_videos,
+            video_position_ids=video_position_ids,
+        )
+
     def get_audio_features(
         self,
         input_features: Array,
@@ -3448,6 +3579,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         input_ids: Array,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        video_position_ids: Array | None = None,
         input_features: Array | None = None,
         input_features_mask: Array | None = None,
     ) -> Array:
@@ -3457,6 +3590,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             input_ids: Token IDs ``[batch, seq_len]``.
             pixel_values: Optional image data for the vision encoder.
             image_position_ids: Optional 2-D image position ids.
+            pixel_values_videos: Optional video frame patches / pixels.
+            video_position_ids: Optional 2-D video patch position ids.
             input_features: ``(B, T_mel, F_mel)`` audio log-mel features.
             input_features_mask: ``(B, T_mel)`` audio validity mask.
 
@@ -3467,6 +3602,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             input_ids,
             pixel_values,
             image_position_ids=image_position_ids,
+            pixel_values_videos=pixel_values_videos,
+            video_position_ids=video_position_ids,
             input_features=input_features,
             input_features_mask=input_features_mask,
         )
@@ -3476,6 +3613,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         input_ids: Array,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        video_position_ids: Array | None = None,
         input_features: Array | None = None,
         input_features_mask: Array | None = None,
         **kwargs,
@@ -3485,6 +3624,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_position_ids=image_position_ids,
+            pixel_values_videos=pixel_values_videos,
+            video_position_ids=video_position_ids,
             input_features=input_features,
             input_features_mask=input_features_mask,
             **kwargs,
@@ -3545,6 +3686,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         input_ids: Array | None = None,
         pixel_values: Array | None = None,
         image_position_ids: Array | None = None,
+        pixel_values_videos: Array | None = None,
+        video_position_ids: Array | None = None,
         input_features: Array | None = None,
         input_features_mask: Array | None = None,
         attention_mask: Array | None = None,
@@ -3570,6 +3713,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             input_ids: Token IDs ``[batch, seq_len]``.
             pixel_values: Image data for the vision encoder.
             image_position_ids: Optional 2-D image position ids.
+            pixel_values_videos: Video frame patches / pixels for the vision encoder.
+            video_position_ids: Optional 2-D video patch position ids.
             input_features: ``(B, T_mel, F_mel)`` audio log-mel features.
             input_features_mask: ``(B, T_mel)`` audio validity mask.
             attention_mask: Padding mask ``[batch, seq_len]``.
@@ -3592,6 +3737,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_position_ids=image_position_ids,
+            pixel_values_videos=pixel_values_videos,
+            video_position_ids=video_position_ids,
             input_features=input_features,
             input_features_mask=input_features_mask,
             attention_mask=attention_mask,
@@ -3622,12 +3769,12 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
     def update_inputs_for_generation(self, model_outputs, model_kwargs):
         """Strip multimodal-specific inputs after the first generation step.
 
-        After the initial prefill, vision and audio features are baked into
+        After the initial prefill, vision, video, and audio features are baked into
         the KV cache and the running ``input_ids`` no longer contains any
         placeholder tokens, so re-feeding the raw multimodal arrays would be
         both wasted work and a shape mismatch. This removes ``pixel_values``,
-        ``input_features``, ``token_type_ids``, and prompt-length auxiliary
-        inputs from the generation kwargs.
+        ``pixel_values_videos``, ``input_features``, ``token_type_ids``, and
+        prompt-length auxiliary inputs from the generation kwargs.
 
         Args:
             model_outputs: Outputs from the previous generation step.
@@ -3639,6 +3786,8 @@ class Gemma4ForConditionalGeneration(BaseVisionLanguageModule[Gemma4Model, Gemma
         model_kwargs = super().update_inputs_for_generation(model_outputs, model_kwargs)
         model_kwargs.pop("pixel_values", None)
         model_kwargs.pop("image_position_ids", None)
+        model_kwargs.pop("pixel_values_videos", None)
+        model_kwargs.pop("video_position_ids", None)
         model_kwargs.pop("input_features", None)
         model_kwargs.pop("input_features_mask", None)
         model_kwargs.pop("token_type_ids", None)
