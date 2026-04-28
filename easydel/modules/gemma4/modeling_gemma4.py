@@ -467,20 +467,31 @@ class Gemma4VisionRotaryEmbedding(nn.Module):
     """2-D rotary embedding shared across all Gemma4 vision encoder layers."""
 
     def __init__(self, config: Gemma4VisionConfig, dtype: jnp.dtype = jnp.bfloat16):
-        from easydel.layers import get_frequencies
-
         self.head_dim = config.head_dim
         self.base = config.rope_parameters.get("rope_theta", 100.0)
         self.rotary_dim_per_axis = 2 * (self.head_dim // 4)
         if self.rotary_dim_per_axis <= 0:
             raise ValueError(f"Gemma4 vision head_dim must be at least 4, got {self.head_dim}.")
-        self.frequencies = get_frequencies(
+        self._max_position_embeddings = int(config.max_position_embeddings)
+        self._dtype = dtype
+
+    @cached_property
+    def frequencies(self) -> Array:
+        # Lazy materialization mirrors the text-side ``default_frequencies`` /
+        # ``global_frequencies`` pattern (see Gemma4TextModel below). Setting
+        # this in ``__init__`` instead bakes the array into ``eval_shape`` and
+        # leaves a ``ShapeDtypeStruct`` after ``lazy_init`` + merge — which
+        # then crashes inside ``apply_basic_rope`` with
+        # "'ShapeDtypeStruct' object is not subscriptable".
+        from easydel.layers import get_frequencies
+
+        return get_frequencies(
             head_size=self.rotary_dim_per_axis,
             rotary_dim=self.rotary_dim_per_axis,
-            max_position=config.max_position_embeddings,
+            max_position=self._max_position_embeddings,
             base=self.base,
             rope_scaling=None,
-        ).astype(dtype)
+        ).astype(self._dtype)
 
     def _apply_axis(self, query: Array, key: Array, positions: Array) -> tuple[Array, Array]:
         from easydel.layers.rotary._compute_fns import apply_basic_rope
