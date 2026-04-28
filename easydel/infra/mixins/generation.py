@@ -3065,8 +3065,9 @@ class EasyGenerationMixin:
             q_len=q_len,
             end_index=decode_end_index,
         )
-        if getattr(mask_info, "_causal_baked", False):
-            object.__setattr__(decode_mask_info, "_causal_baked", True)
+        # causal_mask_baked_in is a declared MaskInfo field carried in
+        # tree_flatten's aux_data; apply_kv_lengths() preserves it via
+        # replace(), so no manual forwarding is needed.
         prepared_kwargs["mask_info"] = decode_mask_info
         return prepared_kwargs
 

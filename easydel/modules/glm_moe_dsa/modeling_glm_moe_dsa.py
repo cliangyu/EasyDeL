@@ -967,7 +967,7 @@ class GlmMoeDsaAttention(UnifiedAttention):
             value_states = value_states.transpose(0, 2, 1, 3)
 
         causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+        if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
             causal_for_kernel = False
 
         sliding_window_for_kernel = self.sliding_window

@@ -1133,7 +1133,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
         causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+        if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
             causal_for_kernel = False
 
         sliding_window_for_kernel = self.sliding_window
@@ -1273,7 +1273,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
             k_pe = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
         causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+        if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
             causal_for_kernel = False
 
         sliding_window_for_kernel = self.sliding_window
@@ -1465,7 +1465,7 @@ class UnifiedAttention(AttentionModule, Generic[Cfg]):
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+        if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
             causal_for_kernel = False
 
         sliding_window_for_kernel = self.sliding_window

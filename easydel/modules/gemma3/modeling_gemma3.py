@@ -736,10 +736,10 @@ class Gemma3TextModel(EasyDeLBaseModule):
                 grouped_token_types
             )
 
-            # We've baked causal (and for sliding layers, window) into the attention mask, so the
-            # attention kernel shouldn't apply causal/window again.
-            object.__setattr__(mask_info_full, "_causal_baked", True)
-            object.__setattr__(mask_info_sliding, "_causal_baked", True)
+            # apply_causal() set causal_mask_baked_in=True; the chained
+            # apply_token_type_ids()/apply_sliding_window() preserve it via
+            # replace(). The attention kernel reads this declared field and
+            # skips re-applying causal/window.
         if position_ids is None:
             position_ids = mask_info.q_position_ids
         inputs_embeds = inputs_embeds

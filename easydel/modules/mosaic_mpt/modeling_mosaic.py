@@ -317,7 +317,7 @@ class MptAttention(UnifiedAttention):
         query_states, key_states, value_states = self.apply_qkv_shardings(query_states, key_states, value_states)
 
         causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+        if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
             causal_for_kernel = False
 
         (

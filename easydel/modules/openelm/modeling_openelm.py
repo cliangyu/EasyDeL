@@ -308,7 +308,7 @@ class OpenELMMultiHeadCausalAttention(UnifiedAttention):
         query_states, key_states = self._apply_rotary(query_states, key_states, position_ids, frequencies)
 
         causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+        if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
             causal_for_kernel = False
 
         sliding_window_for_kernel = self.sliding_window

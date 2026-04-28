@@ -1402,7 +1402,7 @@ class Gemma4Attention(UnifiedAttention):
         captured_kv: tuple[Array, Array] = (key_states, value_states)
 
         causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+        if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
             causal_for_kernel = False
 
         sliding_window_for_kernel = self._kernel_sliding_window()
@@ -1542,7 +1542,7 @@ class Gemma4Attention(UnifiedAttention):
         )
 
         causal_for_kernel = self.causal
-        if mask_info is not None and getattr(mask_info, "_causal_baked", False):
+        if mask_info is not None and getattr(mask_info, "causal_mask_baked_in", False):
             causal_for_kernel = False
 
         sliding_window_for_kernel = self._kernel_sliding_window()
@@ -2597,8 +2597,8 @@ class Gemma4TextModel(EasyDeLBaseModule):
             mask_info_sliding = causal_mask_info.apply_sliding_window(
                 Gemma4Attention._hf_sliding_window(self.config.sliding_window)
             ).apply_token_type_ids(grouped_token_types)
-            object.__setattr__(mask_info_full, "_causal_baked", True)
-            object.__setattr__(mask_info_sliding, "_causal_baked", True)
+            # apply_causal() set causal_mask_baked_in=True; replace() preserves
+            # it through apply_token_type_ids() / apply_sliding_window().
 
         if position_ids is None:
             position_ids = mask_info.q_position_ids
