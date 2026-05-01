@@ -1043,7 +1043,18 @@ class Gemma4VisionModel(EasyDeLBaseModule):
             padding_positions=padding_positions,
             output_length=output_length,
         )
-        hidden_states = hidden_states[pooler_mask]
+        # Equivalent to `hidden_states[pooler_mask]` but jit-safe: data-dependent
+        # bool indexing produces a non-concrete shape and crashes under
+        # `model.generate()`'s compiled sample loop (NonConcreteBooleanIndexError).
+        # Stable-sort with `~mask` as key compacts valid soft tokens to the front
+        # of a fixed `[B*L, H]` buffer in row-major True order — matching what
+        # `[pooler_mask]` would have produced. Downstream `_scatter_features_at_token`
+        # only gathers indices `0..N_valid-1` via cumsum, so the trailing invalid
+        # rows are unread.
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+        flat_mask = pooler_mask.reshape(-1)
+        sort_idx = jnp.argsort(jnp.where(flat_mask, 0, 1), stable=True)
+        hidden_states = flat_hidden[sort_idx]
         if self.config.standardize:
             hidden_states = (hidden_states - self.std_bias.value) * self.std_scale.value
         hidden_states = checkpoint_name(hidden_states, "vision_model_output")
